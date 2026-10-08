@@ -4,8 +4,9 @@
 #   ./deploy.sh
 #   gcloud run services describe vendor-qualification-backend --region us-west1
 #
-# Modeled on sensei-workflow-supplier-contract-backend/deploy.sh. No secrets are
-# passed: this service authenticates with the attached service account
+# Modeled on sensei-workflow-supplier-contract-backend/deploy.sh. The only
+# secret passed is the SMTP password, read from .env (gitignored) at run
+# time: this service authenticates with the attached service account
 # (Vertex AI + Firestore audit writes) and verifies Firebase ID tokens itself.
 set -e
 cd "$(dirname "$0")"
@@ -41,6 +42,18 @@ trap 'rm -f "$ENV_FILE"' EXIT
   echo "RAG_GENERATION_MODEL: \"${RAG_GENERATION_MODEL:-gemini-2.5-pro}\""
   echo "ALLOWED_ORIGINS: \"${ALLOWED_ORIGINS:-https://www.scmsensei.ai}\""
   echo "AUTH_DISABLED: \"false\""
+  # Invite/report link base + durable portal store + invitation SMTP.
+  # Hardcoded on purpose: .env carries localhost values that must never
+  # reach production. SMTP credentials come from .env (never the repo).
+  echo "SUPPLIER_PORTAL_BASE_URL: \"https://nh.scmsensei.ai\""
+  echo "SUPPLIER_PORTAL_DB: \"/tmp/supplier_portal.db\""
+  echo "SMTP_HOST: \"${SMTP_HOST:-}\""
+  echo "SMTP_PORT: \"${SMTP_PORT:-587}\""
+  echo "SMTP_USER: \"${SMTP_USER:-}\""
+  echo "SMTP_PASS: \"${SMTP_PASS:-}\""
+  echo "SMTP_FROM: \"${SMTP_FROM:-}\""
+  echo "SMTP_USE_TLS: \"${SMTP_USE_TLS:-1}\""
+  echo "NOTIFICATION_TO: \"${NOTIFICATION_TO:-}\""
 } > "$ENV_FILE"
 
 gcloud run deploy "$SERVICE_NAME" \
