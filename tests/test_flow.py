@@ -2555,3 +2555,59 @@ class SupplierNotificationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+def test_session_scoping_by_inviter():
+    """One buyer sees their own invitations and shared rows, never another
+    buyer's; a supplier sees invitations addressed to them; auth-disabled
+    (the suite's own mode) still sees everything."""
+    import supplier_portal as sp
+
+    # list_invitations() builds a portal link; the suite runs without a base.
+    prev_base = os.environ.get("SUPPLIER_PORTAL_BASE_URL")
+    os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.test"
+
+    mine = sp.issue_token("Scoping Mine Ltd", invited_by="a@buyer.com", supplier_email="s1@co.com")
+    theirs = sp.issue_token("Scoping Theirs Ltd", invited_by="b@buyer.com", supplier_email="s2@co.com")
+    shared = sp.issue_token("Scoping Legacy Ltd", invited_by="", supplier_email="s3@co.com")
+
+    def names(rows):
+        return {r["vendor_name"] for r in rows}
+
+    try:
+        everything = names(sp.list_invitations())
+        assert {"Scoping Mine Ltd", "Scoping Theirs Ltd", "Scoping Legacy Ltd"} <= everything
+
+        buyer_a = names(sp.list_invitations(for_email="a@buyer.com"))
+        assert "Scoping Mine Ltd" in buyer_a
+        assert "Scoping Legacy Ltd" in buyer_a          # shared rows stay visible
+        assert "Scoping Theirs Ltd" not in buyer_a      # the other buyer's invite
+
+        supplier_s2 = names(sp.list_invitations(for_email="s2@co.com"))
+        assert "Scoping Theirs Ltd" in supplier_s2
+        assert "Scoping Mine Ltd" not in supplier_s2
+
+        subs_a = {r["vendor_name"] for r in sp.list_submissions(for_email="a@buyer.com")}
+        assert "Scoping Mine Ltd" in subs_a
+        assert "Scoping Theirs Ltd" not in subs_a
+        assert "Scoping Theirs Ltd" not in {
+            r["vendor_name"] for r in sp.list_submissions(for_email="a@buyer.com")
+        }
+
+        assert sp.session_owned(mine, "a@buyer.com") is True
+        assert sp.session_owned(theirs, "a@buyer.com") is False
+        assert sp.session_owned(mine, "") is True       # unscoped sees all
+        assert "Scoping Theirs Ltd" not in sp.visible_vendors("a@buyer.com")
+        assert "Scoping Mine Ltd" in sp.visible_vendors("a@buyer.com")
+
+        assert sp.notification_owned("", "a@buyer.com") is False  # tokenless rows
+        assert sp.notification_owned("", "") is True
+    finally:
+        for t in (mine, theirs, shared):
+            try:
+                sp.delete_invitation(t)
+            except Exception:
+                pass
+        if prev_base is None:
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+        else:
+            os.environ["SUPPLIER_PORTAL_BASE_URL"] = prev_base

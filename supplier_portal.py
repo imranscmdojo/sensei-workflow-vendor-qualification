@@ -2356,7 +2356,63 @@ def _assessment_summary(internal: Dict[str, Any]) -> Dict[str, Any]:
 # Firebase authentication and is the only path that exposes the assessment.
 # --------------------------------------------------------------------------
 
-def list_submissions() -> List[Dict[str, Any]]:
+# ── Tenant scoping ──────────────────────────────────────────────────────────
+# Every session records who minted it (`invited_by`). Console reads filter on
+# that so one buyer's dashboard never shows another buyer's invitations.
+# `for_email == ""` (auth disabled — local dev and the test suite) sees all.
+def _session_owned(session: Session, for_email: str) -> bool:
+    if not for_email:
+        return True
+    owner = (session.invited_by or "").strip().lower()
+    # Rows minted before inviter tracking, and the local "presenter"
+    # stand-in, stay shared rather than vanishing from every dashboard.
+    if not owner or owner == "presenter":
+        return True
+    return owner == for_email
+
+
+def _session_visible(session: Session, for_email: str) -> bool:
+    """Ownership, plus a supplier's own view of their invitation."""
+    if _session_owned(session, for_email):
+        return True
+    return (session.supplier_email or "").strip().lower() == for_email
+
+
+def session_owned(token: str, for_email: str) -> bool:
+    """Whether `for_email` owns the session behind `token`. False when gone."""
+    if not for_email:
+        return True
+    with _SESSIONS_LOCK:
+        session = _SESSIONS.get(token or "")
+    return bool(session) and _session_owned(session, for_email)
+
+
+def visible_vendors(for_email: str) -> set:
+    """Vendor names `for_email` owns (or that are shared rows)."""
+    vendors: set = set()
+    with _SESSIONS_LOCK:
+        sessions = list(_SESSIONS.values())
+    for session in sessions:
+        if session.vendor_name and _session_owned(session, for_email):
+            vendors.add(session.vendor_name)
+    return vendors
+
+
+def notification_owned(token: str, for_email: str) -> bool:
+    """Outbox rows carry the session token — except review invites, which
+    carry their own and resolve back through the submission they open."""
+    if not for_email:
+        return True
+    if session_owned(token, for_email):
+        return True
+    try:
+        payload = get_review_invite(token)  # raises when unknown or expired
+    except Exception:  # noqa: BLE001
+        return False
+    return session_owned(str(payload.get("submission_token") or ""), for_email)
+
+
+def list_submissions(for_email: str = "") -> List[Dict[str, Any]]:
     """Every live session, newest first. Buyer-authenticated at the route."""
     now = time.time()
     rows: List[Dict[str, Any]] = []
@@ -2364,6 +2420,8 @@ def list_submissions() -> List[Dict[str, Any]]:
         sessions = list(_SESSIONS.values())
     for session in sessions:
         if session.is_expired(now):
+            continue
+        if not _session_owned(session, for_email):
             continue
         rows.append({
             "token": session.token,
@@ -2694,7 +2752,7 @@ def set_dossier(token: str, dossier: Dict[str, Any]) -> None:
     _save_session(session)
 
 
-def list_invitations() -> List[Dict[str, Any]]:
+def list_invitations(for_email: str = "") -> List[Dict[str, Any]]:
     db = _db()
     try:
         _restore()
@@ -2702,6 +2760,8 @@ def list_invitations() -> List[Dict[str, Any]]:
         pass
     items = []
     for token, sess in list(_SESSIONS.items()):
+        if not _session_visible(sess, for_email):
+            continue
         items.append({
             "token": token,
             "vendor_name": sess.vendor_name,

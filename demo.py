@@ -754,19 +754,27 @@ def _ensure_restored() -> None:
         pass
 
 
-def _demo_tokens(which: Optional[str] = None) -> List[str]:
+def _demo_tokens(which: Optional[str] = None, inviter: str = "") -> List[str]:
     _ensure_restored()
     with supplier_portal._SESSIONS_LOCK:
-        return [
-            token
-            for token, sess in supplier_portal._SESSIONS.items()
-            if sess.internal.get("demo") and (which is None or sess.internal.get("demo") == which)
-        ]
+        tokens: List[str] = []
+        for token, sess in supplier_portal._SESSIONS.items():
+            if not sess.internal.get("demo"):
+                continue
+            if which is not None and sess.internal.get("demo") != which:
+                continue
+            if inviter:
+                owner = (sess.invited_by or "").strip()
+                if owner and owner != inviter:
+                    # Another buyer's run — their dashboard, their demo row.
+                    continue
+            tokens.append(token)
+        return tokens
 
 
-def _drop_demo_sessions(which: Optional[str] = None) -> List[str]:
-    """Forget seeded sessions everywhere they are stored. Returns their tokens."""
-    tokens = _demo_tokens(which)
+def _drop_demo_sessions(which: Optional[str] = None, inviter: str = "") -> List[str]:
+    """Forget the caller's seeded sessions everywhere they are stored."""
+    tokens = _demo_tokens(which, inviter)
     if not tokens:
         return []
 
@@ -821,9 +829,9 @@ def run_vendor(which: str, inviter: str = "") -> Dict[str, Any]:
             detail="Unknown vendor. Use a, b or c.",
         )
 
-    # Re-running a vendor replaces its previous run: two Vendor A rows in the
-    # presenter's dashboard is one Vendor A too many.
-    _drop_demo_sessions(which)
+    # Re-running a vendor replaces that caller's previous run only: another
+    # buyer's dashboard keeps its own Vendor A row.
+    _drop_demo_sessions(which, inviter)
 
     token = supplier_portal.issue_token(
         recipe["vendor_name"],
@@ -929,11 +937,11 @@ def _alerts_snapshot() -> List[Dict[str, Any]]:
         return list(sp._ALERTS.values())
 
 
-def reset_demo() -> Dict[str, Any]:
-    """Drop every seeded vendor, their alerts, their outbox rows and chasers."""
+def reset_demo(inviter: str = "") -> Dict[str, Any]:
+    """Drop the caller's seeded vendors, their alerts, outbox rows and chasers."""
     from main import delete_chaser_notifications
 
-    tokens = _drop_demo_sessions(None)
+    tokens = _drop_demo_sessions(None, inviter)
     try:
         delete_chaser_notifications()
     except Exception:  # noqa: BLE001

@@ -302,6 +302,17 @@ async def verify_firebase_token(authorization: str = Header(None)) -> Dict[str, 
         raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
 
 
+def _scope_email(decoded: Dict[str, Any]) -> str:
+    """Tenant scope for console reads: the caller's email, lowercased.
+
+    Empty under AUTH_DISABLED (local dev and the test suite see everything);
+    live callers are scoped to the invitations they minted.
+    """
+    if AUTH_DISABLED:
+        return ""
+    return str((decoded or {}).get("email") or "").strip().lower()
+
+
 # ==========================================================================
 # HELPERS
 # ==========================================================================
@@ -1180,8 +1191,8 @@ async def supplier_submit(token: str) -> Dict[str, Any]:
 async def portal_submissions(
     decoded: Dict[str, Any] = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
-    """Every supplier session, for the buyer dashboard."""
-    rows = supplier_portal.list_submissions()
+    """Every supplier session, for the buyer dashboard — scoped to the caller."""
+    rows = supplier_portal.list_submissions(for_email=_scope_email(decoded))
     return {"submissions": rows, "count": len(rows)}
 
 
@@ -1346,8 +1357,15 @@ def _submission_envelope(
 async def list_notifications(
     decoded: Dict[str, Any] = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
-    """The presenter outbox: every outbound Tool 1 notification."""
-    return {"notifications": list_notification_log()}
+    """The presenter outbox: every outbound Tool 1 notification the caller owns."""
+    scope = _scope_email(decoded)
+    rows = list_notification_log()
+    if scope:
+        rows = [
+            r for r in rows
+            if supplier_portal.notification_owned(str(r.get("token") or ""), scope)
+        ]
+    return {"notifications": rows}
 
 
 
@@ -1356,8 +1374,8 @@ async def list_notifications(
 async def list_supplier_invitations(
     decoded: Dict[str, Any] = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
-    """List all minted supplier invitations and their state."""
-    items = supplier_portal.list_invitations()
+    """List the caller's minted supplier invitations (plus shared rows)."""
+    items = supplier_portal.list_invitations(for_email=_scope_email(decoded))
     return {"items": items}
 
 
@@ -1370,8 +1388,11 @@ async def delete_supplier_invitation(
     submission — documents, review invites, alert, outbox rows — goes with it.
 
     Internal like the mint, and authenticated the same way: a caller that can
-    invite a supplier can take the invitation back.
+    invite a supplier can take the invitation back — but only their own.
     """
+    if not supplier_portal.session_owned(token, _scope_email(decoded)):
+        # Same answer as an unknown token: ownership is not confirmable.
+        raise HTTPException(status_code=404, detail="Invitation not found.")
     result = supplier_portal.delete_invitation(token)
     delete_notifications([token])
     return {"deleted": True, **result}
@@ -1440,6 +1461,14 @@ async def list_compliance_alerts(
             "created_at": alert.get("created_at"),
         })
     rows.sort(key=lambda r: r.get("created_at") or 0, reverse=True)
+    scope = _scope_email(decoded)
+    if scope:
+        vendors = supplier_portal.visible_vendors(scope)
+        rows = [
+            r for r in rows
+            if supplier_portal.session_owned(str(r.get("supplier_token") or ""), scope)
+            or (r.get("vendor_name") or "") in vendors
+        ]
     return {"alerts": rows}
 
 
@@ -1513,7 +1542,15 @@ async def list_glass_box(
     """
     if not decoded:
         raise HTTPException(status_code=401, detail="Authentication is required.")
-    return {"events": supplier_portal.glassbox_events()}
+    events = supplier_portal.glassbox_events()
+    scope = _scope_email(decoded)
+    if scope:
+        vendors = supplier_portal.visible_vendors(scope)
+        events = [
+            e for e in events
+            if not (e.get("vendor_name") or "") or (e.get("vendor_name") or "") in vendors
+        ]
+    return {"events": events}
 
 
 @app.get("/api/console/agent-activity")
@@ -1531,7 +1568,15 @@ async def list_agent_activity(
     """
     if not decoded:
         raise HTTPException(status_code=401, detail="Authentication is required.")
-    return {"events": supplier_portal.agent_activity_events()}
+    events = supplier_portal.agent_activity_events()
+    scope = _scope_email(decoded)
+    if scope:
+        vendors = supplier_portal.visible_vendors(scope)
+        events = [
+            e for e in events
+            if not (e.get("vendor") or "") or (e.get("vendor") or "") in vendors
+        ]
+    return {"events": events}
 
 
 # ==========================================================================
@@ -1602,9 +1647,9 @@ async def demo_run_vendor(
 async def demo_reset(
     decoded: Dict[str, Any] = Depends(verify_firebase_token),
 ) -> Dict[str, Any]:
-    """Drop every seeded vendor, their alerts, their outbox rows, and reset the clock."""
+    """Drop the caller's seeded vendors (plus shared rows), alerts, outbox rows."""
     import demo
-    return demo.reset_demo()
+    return demo.reset_demo(str(decoded.get("email") or "").strip())
 
 
 @app.on_event("startup")
