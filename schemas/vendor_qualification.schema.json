@@ -1,0 +1,358 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://scmsensei.ai/schemas/vendor_qualification.schema.json",
+  "title": "VendorQualificationOutput",
+  "description": "Strict output contract for Tool 1: Vendor Qualification & Risk Tiering Agent. Reproduces output_schema.md field for field, with one documented exception: on a REJECTED_INCOMPLETE verdict the weighted risk score and risk tier are null, because no assessment was performed and reporting the policy floor of 1.00 / Low Risk (SDD) for an unassessed vendor would be a fabrication. The `allOf` / `if-then` block at the end of this schema encodes that exception, so a validator enforces null-if-and-only-if-incomplete rather than leaving it to convention.",
+
+  "type": "object",
+  "required": [
+    "vendor_id",
+    "vendor_name",
+    "qualification_status",
+    "weighted_risk_score",
+    "assigned_risk_tier",
+    "mandatory_edd_triggered",
+    "trigger_reasons",
+    "appendix_f_score",
+    "guardrail_check_passed",
+    "rag_retrieval_citations",
+    "timestamp",
+    "next_action",
+    "onboarding_flags"
+  ],
+
+  "properties": {
+    "vendor_id": {
+      "type": "string",
+      "pattern": "^VND-[0-9]{4}-[0-9]{5}$",
+      "example": "VND-2026-90412"
+    },
+    "vendor_name": {
+      "type": "string",
+      "example": "Apex Gulf Technical Solutions LLC"
+    },
+    "qualification_status": {
+      "type": "string",
+      "enum": ["QUALIFIED", "REJECTED_INCOMPLETE", "NEEDS_EDD", "REJECTED_HIGH_RISK"]
+    },
+    "weighted_risk_score": {
+      "type": ["number", "null"],
+      "minimum": 1.0,
+      "maximum": 3.0,
+      "example": 2.45
+    },
+    "assigned_risk_tier": {
+      "type": ["string", "null"],
+      "enum": ["Low Risk (SDD)", "Medium Risk (CDD)", "High Risk (EDD)", null],
+      "example": "High Risk (EDD)"
+    },
+    "mandatory_edd_triggered": {
+      "type": "boolean",
+      "example": true
+    },
+    "trigger_reasons": {
+      "type": "array",
+      "items": { "type": "string" },
+      "example": [
+        "Government-Facing Intermediary / Lobbyist Role",
+        "Estimated Spend >= AED 2,000,000"
+      ]
+    },
+
+    "company_profile": {
+      "type": "object",
+      "properties": {
+        "trade_license_no": { "type": "string", "example": "CN-1094821" },
+        "country_of_incorporation": { "type": "string", "example": "United Arab Emirates" },
+        "year_established": { "type": "integer", "minimum": 0, "example": 2015 },
+        "business_category": { "type": "string", "example": "Strategic Supplier" },
+        "vat_registration_no": { "type": "string", "example": "100293847500003" }
+      },
+      "additionalProperties": false
+    },
+
+    "ownership_summary": {
+      "type": "object",
+      "properties": {
+        "structure_complexity": {
+          "type": "string",
+          "enum": ["SIMPLE", "LAYERED", "OFFSHORE"]
+        },
+        "pep_present": { "type": "boolean", "example": false },
+        "ubos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "nationality": { "type": "string" },
+              "ownership_percentage": { "type": "number", "minimum": 0, "maximum": 100 }
+            },
+            "required": ["name", "nationality", "ownership_percentage"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "appendix_f_score": {
+      "type": "object",
+      "description": "Appendix F prequalification score sheet. The model returns a raw 0-100 assessment per category; the 35 / 35 / 30 weights, the total, and the pass/fail gate are computed in Python (agents/vendor_qualification/schemas.py), never by the model.",
+      "properties": {
+        "total_score": { "type": "number", "minimum": 0, "maximum": 100, "example": 84.5 },
+        "financial_standing_score": { "type": "number", "minimum": 0, "maximum": 35, "example": 35.0 },
+        "technical_capability_score": { "type": "number", "minimum": 0, "maximum": 35, "example": 29.5 },
+        "quality_hse_score": { "type": "number", "minimum": 0, "maximum": 30, "example": 20.0 },
+        "status": { "type": "string", "enum": ["PASSED", "FAILED"] }
+      },
+      "required": [
+        "total_score",
+        "financial_standing_score",
+        "technical_capability_score",
+        "quality_hse_score",
+        "status"
+      ]
+    },
+
+    "guardrail_check_passed": {
+      "type": "boolean",
+      "example": true
+    },
+
+    "rag_retrieval_citations": {
+      "type": "array",
+      "description": "Every citation carries the verbatim retrieved text and the source file it came from. `verified` is true only when a Vertex RAG grounding chunk actually supported the rule; an assertion the model made without retrieval support is retained and marked false, so a reviewer can see the difference instead of having to trust it.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "document": { "type": "string", "example": "Procurement Policy_Updated_2.pdf" },
+          "section": { "type": "string", "example": "Mandatory High-Risk Classification" },
+          "rule_applied": {
+            "type": "string",
+            "example": "Any third-party intermediary or agent engaged to interact with government officials is always classified as High Risk."
+          },
+          "quote": { "type": "string", "description": "Verbatim text from the retrieved chunk." },
+          "source_uri": { "type": "string", "description": "Google Drive URI of the source file." },
+          "score": { "type": "number", "description": "Retrieval similarity score for the supporting chunk." },
+          "verified": { "type": "boolean", "description": "True only when a grounding chunk backed this rule." },
+          "matched_trigger": { "type": ["string", "null"], "example": "GOVERNMENT_FACING_INTERMEDIARY" },
+          "factor": { "type": ["string", "null"], "example": "government_exposure" }
+        },
+        "required": ["document", "section", "rule_applied", "verified"]
+      }
+    },
+
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "example": "2026-09-30T16:54:00Z"
+    },
+
+    "next_action": {
+      "type": "string",
+      "example": "Route to Vendor Onboarding Agent for Stage 3 & Stage 4 Compliance Screening"
+    },
+
+    "due_diligence_level": {
+      "type": "string",
+      "description": "SDD / CDD / EDD, derived from the tier band by risk_engine.tier_for().",
+      "example": "Enhanced Due Diligence (EDD)"
+    },
+    "refresh_cycle": {
+      "type": "string",
+      "description": "Refresh cycle mandated by the tier band.",
+      "example": "Annual Refresh"
+    },
+    "rejection_reason": {
+      "type": "string",
+      "description": "Why a REJECTED_HIGH_RISK or REJECTED_INCOMPLETE verdict was returned. Empty for QUALIFIED and NEEDS_EDD."
+    },
+    "weighted_factors": {
+      "type": "array",
+      "description": "The eight weighted factors with their weight, score, the rule text that applied, and the policy basis. The dossier's arithmetic, exposed so a reviewer can recompute the total by hand.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "factor": { "type": "string" },
+          "label": { "type": "string" },
+          "weight": { "type": "number" },
+          "score": { "type": "number", "minimum": 1.0, "maximum": 3.0 },
+          "rule": { "type": "string" },
+          "basis": { "type": "string" },
+          "signal": {
+            "type": ["string", "null"],
+            "description": "Normalised signal value that produced the score. Null means the factor was not assessable and sits at the neutral 2.00 anchor."
+          }
+        },
+        "required": ["factor", "label", "weight", "score", "rule", "basis"]
+      }
+    },
+    "trigger_details": {
+      "type": "array",
+      "description": "Each mandatory EDD trigger that fired, with the policy section, the policy basis, and the minimum controls it requires.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": { "type": "string", "example": "STRATEGIC_SPEND" },
+          "label": { "type": "string" },
+          "policy_section": { "type": "string" },
+          "policy_basis": { "type": "string" },
+          "minimum_controls": { "type": "string" }
+        },
+        "required": ["code", "label", "policy_section", "policy_basis", "minimum_controls"]
+      }
+    },
+    "citation_summary": {
+      "type": "object",
+      "properties": {
+        "total": { "type": "integer" },
+        "verified": { "type": "integer" },
+        "unverified": { "type": "integer" },
+        "sources": { "type": "array", "items": { "type": "string" } },
+        "sections": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "jurisdiction_assessment": {
+      "type": "object",
+      "properties": {
+        "tier": { "type": ["string", "null"], "enum": ["low", "medium", "high", "prohibited", "undetermined", null] },
+        "tier_source": { "type": ["string", "null"], "enum": ["rag", "form", "unknown", null] },
+        "basis": { "type": "string", "description": "Quoted policy text establishing the tier." }
+      }
+    },
+    "required_controls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "control": { "type": "string" },
+          "basis": { "type": "string" },
+          "mandatory": { "type": "boolean" }
+        },
+        "required": ["control", "basis", "mandatory"]
+      }
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "assessment_narrative": {
+      "type": "string",
+      "description": "Plain-language summary for a procurement officer. Deliberately carries no numeric score and no tier name: those are computed by the scoring engine."
+    },
+    "assessment_notes": {
+      "type": "array",
+      "description": "Every signal that was derived from disclosed data rather than read from a declared field, so a reviewer can see where the engine filled a gap.",
+      "items": { "type": "string" }
+    },
+    "missing_data_request": {
+      "type": "object",
+      "description": "Present only on a REJECTED_INCOMPLETE verdict.",
+      "properties": {
+        "message": { "type": "string" },
+        "form": { "type": "string" },
+        "count": { "type": "integer" },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": { "type": "string" },
+              "label": { "type": "string" },
+              "form_item": { "type": "string", "example": "Item 14" },
+              "section": { "type": "string" },
+              "requirement": { "type": "string", "enum": ["MANDATORY", "CONDITIONAL", "ADVISORY"] },
+              "reason": { "type": "string" },
+              "condition": { "type": "string" },
+              "details": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["field", "label", "form_item", "section", "requirement", "reason"]
+          }
+        }
+      },
+      "required": ["message", "form", "count", "fields"]
+    },
+    "advisory_fields": {
+      "type": "array",
+      "description": "Recorded but never blocking. Present only on a REJECTED_INCOMPLETE verdict.",
+      "items": { "type": "object" }
+    },
+    "rag_available": {
+      "type": "boolean",
+      "description": "False when the corpus could not be reached. The deterministic assessment is still complete and correct in that case; only the citations are absent."
+    },
+    "onboarding_flags": {
+      "type": "object",
+      "description": "Governance handoff for Tool 2 (contracting). These are not risk inputs: nothing here changes the weighted score, the Appendix F sheet, or the qualification status. They tell the downstream tool what it must verify itself before it may treat this submission as onboarded. Always present, including on a REJECTED_INCOMPLETE verdict.",
+      "required": [
+        "bank_callback_verification_required",
+        "audited_financials_verified"
+      ],
+      "properties": {
+        "bank_callback_verification_required": {
+          "type": "boolean",
+          "description": "Always true. This tool records the bank name, account holder, and IBAN exactly as the supplier typed them and never contacts the bank, so the account cannot be considered confirmed. Tool 2 must make an independent callback to the bank on a known-good number before any payment or contract execution. A constant true is deliberate: the flag records that the check was never performed here, and it must not be treated as a vendor risk factor.",
+          "example": true
+        },
+        "audited_financials_verified": {
+          "type": "boolean",
+          "description": "True only when the supplier declared audited financial statements (Item 40a) AND the Item 84 audited-report attachment is present. False when the declaration is No, absent, or unanswered, or when the document is missing. This reflects evidence declared and referenced on the form; the report itself is not read or inspected by this tool.",
+          "example": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+
+  "allOf": [
+    {
+      "description": "A REJECTED_INCOMPLETE submission was never assessed, so the score and tier must be null.",
+      "if": {
+        "properties": { "qualification_status": { "const": "REJECTED_INCOMPLETE" } },
+        "required": ["qualification_status"]
+      },
+      "then": {
+        "properties": {
+          "weighted_risk_score": { "type": "null" },
+          "assigned_risk_tier": { "type": "null" },
+          "mandatory_edd_triggered": { "const": false },
+          "guardrail_check_passed": { "const": false }
+        }
+      }
+    },
+    {
+      "description": "Every assessed status must carry a real score inside the policy's 1.00-3.00 range and one of the three tier labels.",
+      "if": {
+        "properties": {
+          "qualification_status": { "enum": ["QUALIFIED", "NEEDS_EDD", "REJECTED_HIGH_RISK"] }
+        },
+        "required": ["qualification_status"]
+      },
+      "then": {
+        "properties": {
+          "weighted_risk_score": { "type": "number", "minimum": 1.0, "maximum": 3.0 },
+          "assigned_risk_tier": {
+            "type": "string",
+            "enum": ["Low Risk (SDD)", "Medium Risk (CDD)", "High Risk (EDD)"]
+          }
+        }
+      }
+    },
+    {
+      "description": "A triggered mandatory EDD override is always reported as High Risk (EDD). The engine raises the score to at least 2.50, so a Low or Medium tier alongside a trigger is impossible by construction and is rejected here.",
+      "if": {
+        "properties": { "mandatory_edd_triggered": { "const": true } },
+        "required": ["mandatory_edd_triggered"]
+      },
+      "then": {
+        "properties": {
+          "assigned_risk_tier": { "const": "High Risk (EDD)" },
+          "weighted_risk_score": { "type": "number", "minimum": 2.5, "maximum": 3.0 },
+          "qualification_status": { "enum": ["NEEDS_EDD", "REJECTED_HIGH_RISK"] }
+        },
+        "required": ["trigger_reasons"]
+      }
+    }
+  ]
+}

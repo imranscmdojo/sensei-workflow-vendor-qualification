@@ -1,0 +1,49 @@
+#!/bin/bash
+# Local dev runner for the Vendor Qualification backend.
+#
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#   ./dev-venv
+#
+# Activate the venv first if you want a shell with the deps on PATH; this
+# script also works without that, because it prefers .venv/bin/uvicorn.
+
+set -e
+cd "$(dirname "$0")"
+
+PORT=8097
+
+# 8097 is deliberate: 8090 is the draft-chat backend, and 8088/8089 are
+# taken by the RFP and contract-review backends.
+IN_USE=$(ss -ltn 2>/dev/null | grep -c ":$PORT " || true)
+if [ "$IN_USE" -ne 0 ]; then
+  echo "Port $PORT is already in use. Stop that process, or edit PORT in dev-venv."
+  ss -ltnp 2>/dev/null | grep ":$PORT " || true
+  exit 1
+fi
+
+if [ -f .env ]; then
+  set -a; source .env; set +a
+fi
+
+# Local only: skip Firebase token verification so you can drive the endpoints
+# with curl. main.py calls load_dotenv() itself, so this must be set explicitly
+# rather than unset - load_dotenv does not override variables that already
+# exist, so this value survives. deploy.sh passes AUTH_DISABLED=false, so the
+# deployed service always verifies tokens.
+export AUTH_DISABLED=true
+
+# Prefer the project venv so the script works whether or not it is activated.
+if [ -x .venv/bin/uvicorn ]; then
+  UVICORN=.venv/bin/uvicorn
+elif command -v uvicorn >/dev/null 2>&1; then
+  UVICORN=uvicorn
+else
+  echo "uvicorn not found. Run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+  exit 1
+fi
+
+echo "Vendor Qualification backend on http://localhost:$PORT"
+echo "Health: curl http://localhost:$PORT/health"
+
+exec "$UVICORN" main:app --host 0.0.0.0 --port "$PORT" --reload

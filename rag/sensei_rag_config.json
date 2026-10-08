@@ -1,0 +1,40 @@
+{
+  "_comment": "RAG corpus binding for the Vendor Qualification & Risk Tiering agent. The corpus is the shared Sensei corpus used by the Supplier Contract Review workflow and already contains the National Holding Procurement Policy. It is deliberately NOT re-ingested or duplicated: pointing RAG_CORPUS at a dedicated corpus later is a one-variable change in agents/base_rag_agent.py.",
+  "rag_corpus": "projects/test-rag-corpus-project/locations/us-west1/ragCorpora/137359788634800128",
+  "display_name": "rag-data-full-corpus",
+  "project_id": "test-rag-corpus-project",
+  "location": "us-west1",
+  "sharing_with_generator_and_discriminator_models": true,
+  "retrieval_config": {
+    "default_model_name": "gemini-2.5-pro",
+    "retrieval_model_name": "gemini-2.5-flash",
+    "similarity_top_k": 15,
+    "vector_distance_threshold": 0.5,
+    "_comment": "15 chunks is enough to span the Risk Scoring Matrix, the Mandatory High-Risk Classification list, and the Vendor Category Risk Treatment matrix in one pass. Matches the contract-review workflow."
+  },
+  "generation_config": {
+    "temperature": 0.1,
+    "top_p": 0.95,
+    "max_output_tokens": 8192,
+    "response_mime_type": "application/json",
+    "_comment": "Low temperature. The model writes narrative and cites policy; it never computes a score. Every number in the dossier is produced by risk_engine.py."
+  },
+  "policy_document": {
+    "file_name": "Procurement Policy_Updated_2.pdf",
+    "local_copy": "/home/imran-scmdojo/Downloads/Procurement Policy_Updated (1).pdf",
+    "section": "VENDOR LIFECYCLE MANAGEMENT",
+    "pages": 11
+  },
+  "form": {
+    "file_name": "NH-PQF-001-Rev.09 - Vendor Prequalification & FTA Verification Form.xlsx",
+    "local_copy": "/home/imran-scmdojo/Downloads/NH-PQF-001-Rev.09 - Vendor Prequalification & FTA Verification Form.xlsx",
+    "effective": "2026-10-01",
+    "supersedes": "Rev.06",
+    "sections": 16,
+    "items": 138
+  },
+  "operational_notes": [
+    "rag.list_files() on this corpus currently returns HTTP 429 (VertexRagDataService quota). Retrieval and grounded generation are unaffected, so corpus file listing is never on the request path.",
+    "If the corpus is ever rebuilt, the country risk tiers in the KYC and Due Diligence Policy (Appendix B) are still missing: the weighted matrix and the three client references are hardcoded in risk_engine.py and schemas.py and documented there as the single place to change them when the GCICD matrix is supplied."
+  ]
+}

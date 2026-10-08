@@ -1,0 +1,25 @@
+fastapi==0.115.0
+uvicorn==0.32.0
+google-cloud-aiplatform==1.73.0
+firebase-admin==6.5.0
+python-dotenv==1.0.0
+jsonschema==4.23.0
+# agents/base_rag_agent.py parses the RAG corpus config with these, and
+# regex backs the tokenisation used for citation quote matching.
+json5==0.9.25
+dirtyjson==1.0.8
+regex==2024.11.6
+# Smart auto-fill reads the uploaded trade licence / company profile.
+# pypdf pulls the PDF text layer and python-docx reads .docx; neither does OCR
+# (see extraction.py for why that is a deliberate gap, not an oversight).
+# python-multipart is what FastAPI needs before it will accept a file upload.
+pypdf==5.1.0
+python-docx==1.1.2
+python-multipart==0.0.20
+# Test-only. httpx is what starlette.testclient drives the routes through, so the
+# supplier-portal acceptance tests exercise the real HTTP layer — the 403 on a
+# non-MLRO decision and the GET-is-not-a-POST split are properties of the routes,
+# not of the functions behind them, and testing the functions alone would assert
+# nothing that matters.
+httpx==0.28.1
+pytest==9.1.1
