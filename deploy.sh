@@ -27,6 +27,22 @@ fi
 
 echo "Deploying $SERVICE_NAME to Cloud Run..."
 
+# `--set-env-vars` splits its value list on commas, so ALLOWED_ORIGINS — itself
+# a comma-separated origin list — blew it up with "Bad syntax for dict arg".
+# `--env-vars-file` takes YAML, where a comma is just text in a quoted string.
+ENV_FILE="$(mktemp)"
+trap 'rm -f "$ENV_FILE"' EXIT
+{
+  echo "PROJECT_ID: \"$PROJECT_ID\""
+  echo "FIREBASE_PROJECT_ID: \"$FIREBASE_PROJECT_ID\""
+  echo "LOCATION: \"$REGION\""
+  echo "RAG_CORPUS: \"$CORPUS\""
+  echo "RAG_RETRIEVAL_MODEL: \"${RAG_RETRIEVAL_MODEL:-gemini-2.5-flash}\""
+  echo "RAG_GENERATION_MODEL: \"${RAG_GENERATION_MODEL:-gemini-2.5-pro}\""
+  echo "ALLOWED_ORIGINS: \"${ALLOWED_ORIGINS:-https://www.scmsensei.ai}\""
+  echo "AUTH_DISABLED: \"false\""
+} > "$ENV_FILE"
+
 gcloud run deploy "$SERVICE_NAME" \
   --source . \
   --project "$PROJECT_ID" \
@@ -38,15 +54,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --min-instances 0 \
   --concurrency 40 \
   --timeout 3600 \
-  --set-env-vars \
-PROJECT_ID="$PROJECT_ID",\
-FIREBASE_PROJECT_ID="$FIREBASE_PROJECT_ID",\
-LOCATION="$REGION",\
-RAG_CORPUS="$CORPUS",\
-RAG_RETRIEVAL_MODEL="${RAG_RETRIEVAL_MODEL:-gemini-2.5-flash}",\
-RAG_GENERATION_MODEL="${RAG_GENERATION_MODEL:-gemini-2.5-pro}",\
-ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-https://www.scmsensei.ai}",\
-AUTH_DISABLED="false"
+  --env-vars-file "$ENV_FILE"
 
 SERVICE_URL="https://$SERVICE_NAME-214011868588.$REGION.run.app"
 
