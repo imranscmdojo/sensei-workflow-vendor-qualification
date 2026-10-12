@@ -2540,6 +2540,31 @@ class SupplierNotificationTest(unittest.TestCase):
             for var in ("NOTIFICATION_TO", "SUPPLIER_PORTAL_BASE_URL"):
                 os.environ.pop(var, None)
 
+    def test_buyer_submission_notice_is_not_diverted_to_the_pilot_inbox(self):
+        """NOTIFICATION_TO is a fallback for a missing inviter, not an override.
+
+        The submission notice goes to the buyer who invited the supplier. With
+        the override on, it landed in the pilot inbox instead and the inviting
+        buyer never learned their vendor had submitted.
+        """
+        os.environ["NOTIFICATION_TO"] = "pilot@example.com"
+        try:
+            from services import email as email_service
+
+            result = email_service.notify_submission(
+                "buyer@example.com", "Apex Gulf LLC", "High Risk (EDD)",
+                "2.50", "Enhanced Due Diligence (EDD)", "https://x/report")
+            self.assertEqual(result.recipient, "buyer@example.com")
+
+            # No inviter on file: the pilot inbox still catches the notice,
+            # which is the only thing NOTIFICATION_TO is for.
+            orphan = email_service.notify_submission(
+                None, "Apex Gulf LLC", "High Risk (EDD)",
+                "2.50", "Enhanced Due Diligence (EDD)", "https://x/report")
+            self.assertEqual(orphan.recipient, "pilot@example.com")
+        finally:
+            os.environ.pop("NOTIFICATION_TO", None)
+
     def test_the_supplier_decision_mail_carries_no_assessment(self):
         """The firewall cannot reach their inbox, so it is enforced here too."""
         from services import email as email_service

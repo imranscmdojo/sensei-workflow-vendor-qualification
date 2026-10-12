@@ -206,12 +206,22 @@ def notify_submission(
     due_diligence: str,
     link: str,
 ) -> SendResult:
-    """The one notification this system sends."""
+    """The one notification this system sends.
+
+    It goes to the inviter — the buyer who invited the supplier — because that
+    is who has to review the submission. `NOTIFICATION_TO` (the pilot inbox) is
+    a fallback for when no inviter is on file, never an override: aiming the
+    buyer's own submission notice at the pilot meant the buyer never learned
+    their vendor submitted while the pilot saw "sent".
+    """
+    recipient = ((to or "").strip()
+                 or (os.environ.get("NOTIFICATION_TO", "") or "").strip())
     return send(
-        to or "",
+        recipient,
         f"{SUBJECT}: {vendor_name}",
         submission_body(vendor_name, tier, score, due_diligence, link),
         submission_html(vendor_name, tier, score, due_diligence, link),
+        use_override=False,
     )
 
 # --------------------------------------------------------------------------
