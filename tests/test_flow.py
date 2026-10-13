@@ -3009,3 +3009,123 @@ def test_session_scoping_by_inviter():
             os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
         else:
             os.environ["SUPPLIER_PORTAL_BASE_URL"] = prev_base
+
+
+class ResubmissionTest(unittest.TestCase):
+    """A rejection hands the file back, and the supplier's second Submit is the answer.
+
+    That answer used to hit `submit_session`'s idempotency guard and stop
+    there: the buyer got no mail, the status never moved, and the only thing
+    that brought the submission back into the queue was uploading a document.
+    The guard is right — a double-click must not announce the same submission
+    twice — so it is the discriminator that changes, not the guard: a duplicate
+    arrives while the form is already "Under review", a resubmission arrives
+    while it is "Action required", and only a rejection ever puts it there.
+    """
+
+    def setUp(self):
+        supplier_portal.reset_all()
+        for var in ("SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+                    "SMTP_FROM", "NOTIFICATION_TO", "SUPPLIER_PORTAL_BASE_URL"):
+            os.environ.pop(var, None)
+        self.token = supplier_portal.issue_token(
+            "Apex Gulf Technical Solutions LLC", invited_by="buyer@firm.com")
+        session = supplier_portal._load_session(self.token)
+        session.form.update(vendor_c_form())
+        supplier_portal._save_session(session)
+        supplier_portal.submit_session(self.token, notify=False)
+
+    def _reject(self):
+        supplier_portal.record_submission_decision(
+            self.token, "rejected", "buyer@firm.com",
+            "The trade licence expired last month.")
+
+    def _notify_both(self):
+        """Patch both buyer templates and report which one was used."""
+        used: List[str] = []
+
+        def _record(name):
+            def _fn(*args, **kwargs):
+                used.append(name)
+                return main.SendResult(True, "ok", args[0] or "")
+            return _fn
+
+        patcher = mock.patch.multiple(
+            "services.email",
+            notify_submission=_record("first"),
+            notify_resubmission=_record("resubmission"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return used
+
+    def test_a_rejection_raises_a_resubmission_request(self):
+        self._reject()
+        view = supplier_portal.buyer_view(self.token)
+        self.assertEqual(view["status"], "Action required")
+        self.assertIsNotNone(view["resubmission_requested_at"])
+        row = next(r for r in supplier_portal.list_submissions()
+                   if r["token"] == self.token)
+        self.assertIsNotNone(row["resubmission_requested_at"])
+
+    def test_answering_the_request_clears_the_tag_and_moves_it_back(self):
+        self._reject()
+        out = supplier_portal.submit_session(self.token, notify=False)
+        self.assertTrue(out["resubmitted"])
+        self.assertEqual(out["resubmission_count"], 1)
+        view = supplier_portal.buyer_view(self.token)
+        self.assertEqual(view["status"], "Under review")
+        self.assertIsNone(view["resubmission_requested_at"])
+        self.assertEqual(view["resubmission_count"], 1)
+
+    def test_a_second_submit_without_a_rejection_is_still_just_a_duplicate(self):
+        """The guard is untouched: nothing was asked for, so nothing was sent."""
+        out = supplier_portal.submit_session(self.token, notify=False)
+        self.assertTrue(out["already_submitted"])
+        self.assertFalse(out["resubmitted"])
+        self.assertEqual(out["resubmission_count"], 0)
+        self.assertEqual(supplier_portal.buyer_view(self.token)["status"],
+                         "Under review")
+
+    def test_the_buyer_is_told_distinctly_that_the_form_came_back(self):
+        used = self._notify_both()
+        self._reject()
+        supplier_portal.submit_session(self.token, notify=True)
+        self.assertEqual(used, ["resubmission"])
+        self.assertEqual(
+            supplier_portal.buyer_view(self.token)["notification"]["recipient"],
+            "buyer@firm.com")
+
+    def test_a_first_submission_keeps_its_own_mail(self):
+        used = self._notify_both()
+        token = supplier_portal.issue_token("Second Vendor Co",
+                                            invited_by="buyer@firm.com")
+        session = supplier_portal._load_session(token)
+        session.form.update(vendor_c_form())
+        supplier_portal._save_session(session)
+        supplier_portal.submit_session(token, notify=True)
+        self.assertEqual(used, ["first"])
+
+    def test_the_outbox_calls_it_a_resubmission(self):
+        self._reject()
+        supplier_portal.submit_session(self.token, notify=True)
+        rows = [r for r in main.list_notification_log()
+                if r["token"] == self.token]
+        buyer = [r for r in rows
+                 if r.get("recipient") == "buyer@firm.com" and r["kind"]]
+        self.assertIn("resubmission", {r["kind"] for r in buyer})
+        self.assertTrue(all("resubmitted" in r["subject"].lower()
+                            for r in buyer if r["kind"] == "resubmission"))
+
+    def test_nothing_the_supplier_sent_before_is_discarded(self):
+        """The point of the feature: a revision, not a replacement."""
+        self._reject()
+        before = supplier_portal.buyer_view(self.token)
+        supplier_portal.submit_session(self.token, notify=False)
+        after = supplier_portal.buyer_view(self.token)
+        self.assertEqual(after["documents"], before["documents"])
+        self.assertEqual(len(after["decision_history"]), 1)
+        self.assertEqual(after["decision"]["justification"],
+                         "The trade licence expired last month.")
+        # The assessment is the part that is supposed to be recomputed.
+        self.assertIsNotNone(after["assessment"]["weighted_risk_score"])

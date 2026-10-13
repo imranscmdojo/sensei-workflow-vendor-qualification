@@ -1212,6 +1212,7 @@ async def supplier_submit(token: str) -> Dict[str, Any]:
         "status": result["status"],
         "submitted_at": result["submitted_at"],
         "already_submitted": result["already_submitted"],
+        "resubmitted": result.get("resubmitted", False),
     }
 
 

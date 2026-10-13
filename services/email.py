@@ -36,6 +36,7 @@ from email.mime.multipart import MIMEMultipart
 from typing import Dict, Optional
 
 SUBJECT = "Vendor submitted their onboarding form"
+RESUBMISSION_SUBJECT = "Vendor resubmitted their onboarding form"
 
 
 @dataclass
@@ -106,6 +107,110 @@ def submission_html(
       result above are internal and are not shown to them.</p>
   </div>
 </body></html>"""
+
+
+def resubmission_body(
+    vendor_name: str,
+    tier: str,
+    score: str,
+    due_diligence: str,
+    link: str,
+    resubmission_count: int = 1,
+) -> str:
+    """Plain-text alternative for a resubmission. Kept beside the HTML for the
+    same reason as the others: a template that drifts from its twin is one the
+    buyer reads and the supplier does not.
+    """
+    return (
+        f"{vendor_name} has resubmitted their vendor onboarding form after "
+        f"you asked for changes.\n\n"
+        f"  Resubmissions  {resubmission_count}\n"
+        f"  Risk tier      {tier}\n"
+        f"  Score          {score}\n"
+        f"  Due diligence  {due_diligence}\n\n"
+        f"Review the updated submission here:\n{link}\n\n"
+        "Nothing was discarded. Their earlier documents, the clarifications\n"
+        "raised against them and your own decision history are all still on the\n"
+        "file — this is a revision of the same submission, not a replacement.\n\n"
+        "The supplier sees only 'Under review'. The tier, score and any screening\n"
+        "result above are internal and are not shown to them.\n"
+    )
+
+
+def resubmission_html(
+    vendor_name: str,
+    tier: str,
+    score: str,
+    due_diligence: str,
+    link: str,
+    resubmission_count: int = 1,
+) -> str:
+    esc = (
+        vendor_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    return f"""<!doctype html>
+<html><body style="margin:0;padding:24px;background:#f6f6f4;
+  font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#1c1c1a;">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e3e3df;
+    border-radius:12px;padding:26px 28px;">
+    <div style="text-align:center;padding-bottom:16px;border-bottom:1px solid #eeeeea;margin-bottom:16px;"><img src="cid:nh-logo" alt="National Holding" width="180" style="display:inline-block;max-width:100%;height:auto;"></div>
+    <p style="margin:0 0 4px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+      color:#6b6b66;">Vendor onboarding</p>
+    <h1 style="margin:0 0 16px;font-size:20px;line-height:1.3;">{esc} resubmitted their form</h1>
+    <p style="margin:0 0 18px;font-size:14px;line-height:1.6;color:#4a4a45;">
+      You sent this file back for changes. The supplier has answered.</p>
+    <table style="width:100%;border-collapse:collapse;margin:0 0 20px;font-size:14px;">
+      <tr><td style="padding:8px 0;border-top:1px solid #eee;color:#6b6b66;">Resubmissions</td>
+        <td style="padding:8px 0;border-top:1px solid #eee;font-weight:600;">{resubmission_count}</td></tr>
+      <tr><td style="padding:8px 0;border-top:1px solid #eee;color:#6b6b66;">Risk tier</td>
+        <td style="padding:8px 0;border-top:1px solid #eee;font-weight:600;">{tier}</td></tr>
+      <tr><td style="padding:8px 0;border-top:1px solid #eee;color:#6b6b66;">Score</td>
+        <td style="padding:8px 0;border-top:1px solid #eee;font-weight:600;">{score}</td></tr>
+      <tr><td style="padding:8px 0;border-top:1px solid #eee;color:#6b6b66;">Due diligence</td>
+        <td style="padding:8px 0;border-top:1px solid #eee;font-weight:600;">{due_diligence}</td></tr>
+    </table>
+    <a href="{link}" style="display:inline-block;background:#1c1c1a;color:#fff;
+      text-decoration:none;padding:11px 20px;border-radius:8px;font-size:14px;
+      font-weight:600;">Review updated submission</a>
+    <p style="margin:22px 0 0;font-size:12px;line-height:1.6;color:#6b6b66;">
+      Nothing was discarded &mdash; their earlier documents, the clarifications raised
+      against them and your own decision history are all still on the file. This is a
+      revision of the same submission, not a replacement.</p>
+    <p style="margin:12px 0 0;font-size:12px;line-height:1.6;color:#6b6b66;">
+      The supplier sees only &ldquo;Under review&rdquo;. The tier, score and any screening
+      result above are internal and are not shown to them.</p>
+  </div>
+</body></html>"""
+
+
+def notify_resubmission(
+    to: Optional[str],
+    vendor_name: str,
+    tier: str,
+    score: str,
+    due_diligence: str,
+    link: str,
+    resubmission_count: int = 1,
+) -> SendResult:
+    """Tell the inviter their supplier has sent the form back.
+
+    Separate from `notify_submission` because the two are different events with
+    different asks. The buyer who rejected this file needs to know it returned,
+    and reusing the first-submission notice would leave them unable to tell the
+    two apart in a crowded inbox. Same recipient rule: `NOTIFICATION_TO` is a
+    fallback for when no inviter is on file, never an override.
+    """
+    recipient = ((to or "").strip()
+                 or (os.environ.get("NOTIFICATION_TO", "") or "").strip())
+    return send(
+        recipient,
+        f"{RESUBMISSION_SUBJECT}: {vendor_name}",
+        resubmission_body(vendor_name, tier, score, due_diligence, link,
+                          resubmission_count),
+        resubmission_html(vendor_name, tier, score, due_diligence, link,
+                          resubmission_count),
+        use_override=False,
+    )
 
 
 def send(

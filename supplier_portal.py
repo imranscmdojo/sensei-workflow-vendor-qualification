@@ -2313,14 +2313,29 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
     request over a flaky link, must not produce two emails announcing the same
     submission, so a session that has already been submitted returns its
     original outcome without rescoring or resending.
+
+    The one exception is a resubmission. A rejection hands the form back to the
+    supplier, and pressing Submit again is how they send it back — the buyer
+    has to learn about that as distinctly as they learned about the first one.
+    The discriminator is the status rather than a flag the caller could set: a
+    duplicate submit arrives while the form is already "Under review", a
+    resubmission arrives while it is "Action required", and only a rejection
+    ever puts it there.
     """
     session = _load_session(token)
 
-    if session.submitted_at is not None:
+    resubmitting = (
+        session.submitted_at is not None
+        and session.neutral_status == "Action required"
+    )
+
+    if session.submitted_at is not None and not resubmitting:
         return {
             "vendor_name": session.vendor_name,
             "submitted_at": session.submitted_at,
             "already_submitted": True,
+            "resubmitted": False,
+            "resubmission_count": int(session.internal.get("resubmission_count") or 0),
             "status": session.neutral_status,
             "assessment": _assessment_summary(session.internal),
             "notification": session.internal.get("notification") or {"sent": False,
@@ -2336,6 +2351,21 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
     # and the supplier learns nothing about what it says.
     session.neutral_status = "Under review"
 
+    if resubmitting:
+        # Everything the supplier sent the first time is kept: their documents,
+        # the clarifications raised against them, and the decision history that
+        # says why the form came back. Only the assessment is recomputed, and
+        # `run_assessment` updates `internal` in place rather than replacing it,
+        # so re-scoring cannot take the audit trail with it either.
+        session.internal = dict(
+            session.internal,
+            resubmission_count=int(session.internal.get("resubmission_count") or 0) + 1,
+            resubmitted_at=session.submitted_at,
+            # The request has been answered, so the dashboard's tag comes off.
+            resubmission_requested_at=None,
+        )
+        _save_session(session)
+
     assessment = run_assessment(session)
     summary = _assessment_summary(assessment)
 
@@ -2347,7 +2377,14 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
         try:
             from services import email as email_service
 
-            result = email_service.notify_submission(
+            # Distinct mail for a distinct event. Reusing the first-submission
+            # notice would leave the buyer unable to tell a vendor's opening
+            # form from one they themselves sent back.
+            sender = (
+                email_service.notify_resubmission if resubmitting
+                else email_service.notify_submission
+            )
+            result = sender(
                 session.invited_by or None,
                 session.vendor_name or "A vendor",
                 summary["assigned_risk_tier"],
@@ -2424,8 +2461,12 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
     try:
         from main import log_notification
         log_notification(
-            "submission",
-            f"Vendor submitted their onboarding form: {session.vendor_name or 'A vendor'}",
+            "resubmission" if resubmitting else "submission",
+            (
+                f"Vendor resubmitted their onboarding form: {session.vendor_name or 'A vendor'}"
+                if resubmitting else
+                f"Vendor submitted their onboarding form: {session.vendor_name or 'A vendor'}"
+            ),
             notification_recipient,
             notification_sent,
             notification_detail,
@@ -2451,6 +2492,8 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
         "vendor_name": session.vendor_name,
         "submitted_at": session.submitted_at,
         "already_submitted": False,
+        "resubmitted": resubmitting,
+        "resubmission_count": int(session.internal.get("resubmission_count") or 0),
         "status": session.neutral_status,
         "assessment": summary,
         "notification": result,
@@ -2550,6 +2593,8 @@ def list_submissions(for_email: str = "") -> List[Dict[str, Any]]:
             "created_at": session.created_at,
             "submitted_at": session.submitted_at,
             "has_submitted": session.submitted_at is not None,
+            "resubmission_requested_at": session.internal.get("resubmission_requested_at"),
+            "resubmission_count": int(session.internal.get("resubmission_count") or 0),
             "document_count": len(session.documents),
             "clarification_count": len(session.clarifications),
             "assigned_risk_tier": session.internal.get("assigned_risk_tier"),
@@ -2647,7 +2692,14 @@ def record_submission_decision(
     history = list(session.internal.get("decision_history") or [])
     history.append(record)
     session.internal = dict(
-        session.internal, decision=record, decision_history=history
+        session.internal, decision=record, decision_history=history,
+        # A rejection is a request for a resubmission, so the buyer's dashboard
+        # can say so while it waits. Cleared when the supplier sends the form
+        # back; an approval clears the outstanding request too, because there is
+        # nothing left to answer.
+        resubmission_requested_at=(
+            time.time() if normalised == "rejected" else None
+        ),
     )
     session.neutral_status = "Approved" if normalised == "approved" else "Action required"
 
@@ -2782,6 +2834,8 @@ def buyer_view(token: str) -> Dict[str, Any]:
         "created_at": session.created_at,
         "submitted_at": session.submitted_at,
         "has_submitted": session.submitted_at is not None,
+        "resubmission_requested_at": session.internal.get("resubmission_requested_at"),
+        "resubmission_count": int(session.internal.get("resubmission_count") or 0),
         # As declared, unsummarised.
         "form": dict(session.form),
         # Metadata only — the raw record may carry a base64 preview copy that
