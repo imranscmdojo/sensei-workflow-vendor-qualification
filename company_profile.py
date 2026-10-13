@@ -1127,6 +1127,16 @@ def _primary_segment(value: str) -> str:
 #: how many fields the row carries.
 _COMPOUND_FIELDS: Tuple[Tuple[str, re.Pattern], ...] = (
     ("trade_license_expiry", re.compile(
+        # An identity document carries an expiry too, and its line already
+        # belongs to authorized_representative_id_expiry. Without these
+        # guards "Representative ID Expiry: 2029-08-30" is filed as the trade
+        # licence date whenever the licence line is absent — which is exactly
+        # the shape an incomplete submission has, so the gap it should have
+        # reported gets quietly filled with the wrong date. A licence row
+        # ("Trade Licence Expiry: …", or "… | Expiry: …" beside its number) is
+        # untouched: none of these words precede its expiry.
+        r"(?<!representative id )(?<!emirates id )(?<!passport )"
+        r"(?<!identity )(?<!id )"
         r"\b(?:expiry|expiration|expires|valid\s+until|valid\s+till)"
         r"\s*[::\-]?\s*"
         r"(\d{1,2}[-/\s][A-Za-z]{3,9}[-/\s]\d{4}|\d{4}-\d{1,2}-\d{1,2}"
