@@ -2518,19 +2518,23 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
 
             # Distinct mail for a distinct event. Reusing the first-submission
             # notice would leave the buyer unable to tell a vendor's opening
-            # form from one they themselves sent back.
-            sender = (
-                email_service.notify_resubmission if resubmitting
-                else email_service.notify_submission
-            )
-            result = sender(
-                session.invited_by or None,
-                session.vendor_name or "A vendor",
-                summary["assigned_risk_tier"],
-                summary["weighted_risk_score"],
-                summary["due_diligence_level"],
-                link,
-            )
+            # form from one they themselves sent back. Neither carries the tier,
+            # the score or the due-diligence level any more: those came from the
+            # provisional assessment at submit time, which the full pipeline
+            # routinely contradicts — the buyer was being mailed "Medium Risk,
+            # 1.83" beside a report saying "High Risk, 2.50". The report is the
+            # answer; this mail is only the summons to read it.
+            who = session.invited_by or None
+            name = session.vendor_name or "A vendor"
+            if resubmitting:
+                result = email_service.notify_resubmission(
+                    who,
+                    name,
+                    link,
+                    int(session.internal.get("resubmission_count") or 1),
+                )
+            else:
+                result = email_service.notify_submission(who, name, link)
             notification_recipient = session.invited_by or ""
             notification_detail = getattr(result, "detail", "") or ""
             notification_sent = bool(getattr(result, "sent", False))

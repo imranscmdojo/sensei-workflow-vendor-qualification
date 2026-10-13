@@ -1736,7 +1736,16 @@ class SubmissionNotificationTest(unittest.TestCase):
             self.assertNotIn(banned, blob)
         self.assertNotIn("internal", view)
 
-    def test_the_notification_carries_the_tier_to_the_buyer(self):
+    def test_the_notification_is_a_summons_and_carries_no_result(self):
+        """The mail sends the buyer to the report; it is not the report.
+
+        It used to be handed the tier, the score and the due-diligence level,
+        all of them read from `run_assessment` at submit time — a provisional
+        verdict that the full pipeline then contradicts. Supplier06 was mailed
+        "Medium Risk, 1.83" beside a report saying "High Risk, 2.50", and the
+        buyer had no way to tell which one to believe. The report is the
+        answer; the mail is only the summons to read it.
+        """
         sent = {}
 
         class FakeResult:
@@ -1763,7 +1772,27 @@ class SubmissionNotificationTest(unittest.TestCase):
         # The inviter, from the verified claims — never from the request body.
         self.assertEqual(sent["args"][0], "buyer@firm.com")
         self.assertEqual(sent["args"][1], "Apex Gulf Technical Solutions LLC")
-        self.assertEqual(sent["args"][2], TIER_HIGH)
+        # Recipient, vendor, link — and nothing that reads as a verdict.
+        self.assertEqual(len(sent["args"]), 3)
+
+    def test_no_tier_or_score_reaches_the_buyers_mailbox(self):
+        """Checked in both renderings, because the plain part and the HTML are
+        two templates that have to agree, and either one alone could drift.
+        """
+        from services import email as email_service
+
+        banned = ("risk tier", "due diligence", "weighted", "score",
+                  "medium risk", "high risk", "edd", "cdd", "1.83", "2.50")
+        for render in (email_service.submission_body, email_service.submission_html):
+            text = render("Supplier06", "https://portal.example.com/report").lower()
+            self.assertIn("supplier06", text)
+            for word in banned:
+                self.assertNotIn(word, text, f"{render.__name__} leaked {word!r}")
+        for render in (email_service.resubmission_body, email_service.resubmission_html):
+            text = render("Supplier06", "https://portal.example.com/report", 2).lower()
+            self.assertIn("supplier06", text)
+            for word in banned:
+                self.assertNotIn(word, text, f"{render.__name__} leaked {word!r}")
 
     def _capture_notification_link(self):
         """Submit with the mail service stubbed and return the link it was given."""
@@ -1790,7 +1819,7 @@ class SubmissionNotificationTest(unittest.TestCase):
         finally:
             email_service.notify_submission = original
             os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
-        return token, captured["args"][5]
+        return token, captured["args"][2]
 
     def test_the_notification_links_to_the_report_not_the_supplier_form(self):
         """The email says "Review it here", so "here" has to be the report.
@@ -2745,15 +2774,13 @@ class SupplierNotificationTest(unittest.TestCase):
             from services import email as email_service
 
             result = email_service.notify_submission(
-                "buyer@example.com", "Apex Gulf LLC", "High Risk (EDD)",
-                "2.50", "Enhanced Due Diligence (EDD)", "https://x/report")
+                "buyer@example.com", "Apex Gulf LLC", "https://x/report")
             self.assertEqual(result.recipient, "buyer@example.com")
 
             # No inviter on file: the pilot inbox still catches the notice,
             # which is the only thing NOTIFICATION_TO is for.
             orphan = email_service.notify_submission(
-                None, "Apex Gulf LLC", "High Risk (EDD)",
-                "2.50", "Enhanced Due Diligence (EDD)", "https://x/report")
+                None, "Apex Gulf LLC", "https://x/report")
             self.assertEqual(orphan.recipient, "pilot@example.com")
         finally:
             os.environ.pop("NOTIFICATION_TO", None)
