@@ -1174,6 +1174,7 @@ def record_approval_decision(
         brief["decided_at"] = time.time()
         decided = dict(brief)
 
+        session = None
         if brief.get("supplier_token"):
             session = _SESSIONS.get(brief["supplier_token"])
             if session is not None:
@@ -1183,6 +1184,21 @@ def record_approval_decision(
                 _save_session(session)
 
     _persist_item("approval", token, decided)
+
+    # The supplier is told the outcome, exactly as they are on the console's
+    # own approve/reject. Without this the two routes disagree: the same
+    # decision reaches the supplier when the reviewer clicks a button and
+    # stays silent when they click an emailed brief, and a rejected supplier
+    # who took the brief route is never told to fix anything.
+    #
+    # Done after the lock is released — an SMTP round trip inside
+    # `_APPROVALS_LOCK` would serialise every concurrent approval behind one
+    # send. The brief carries no justification field, so the reason is empty
+    # and the mail says "open your form to see what needs changing" rather
+    # than quoting a blank line.
+    if session is not None:
+        _notify_supplier_decision(session, decision, "")
+
     return read_approval_brief(token)
 
 
@@ -1360,6 +1376,13 @@ def decide_compliance_alert(
                 "Action required" if decision in ("escalated", "rejected") else "Under review"
             )
             _save_session(session)
+            # ...but they do learn that the status moved. Without this the
+            # queue shows the vendor as blocked while the supplier's own page
+            # silently flips to "Action required" with no mail to explain it.
+            # The status word is the whole message: the justification above
+            # stays internal, and `notify_supplier_status_change` has no
+            # parameter that could carry it.
+            _notify_supplier_status(session, session.neutral_status)
 
     _persist_item("alert", alert_id, decided_alert)
 
@@ -2266,6 +2289,10 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
             "assessment": _assessment_summary(session.internal),
             "notification": session.internal.get("notification") or {"sent": False,
                                                                    "detail": "not sent"},
+            "supplier_notification": (
+                session.internal.get("supplier_notification")
+                or {"sent": False, "detail": "not sent"}
+            ),
         }
 
     session.submitted_at = time.time()
@@ -2312,7 +2339,50 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
         notification_detail = "notification suppressed"
         notification_sent = False
 
-    session.internal = dict(session.internal, notification=result)
+    # The supplier gets their own mail: a receipt, and the status button that
+    # brings them back to their form. It carries no tier and no score — the
+    # same neutral firewall the form itself observes.
+    supplier_result: Dict[str, Any] = {
+        "sent": False, "detail": "no supplier email on file", "recipient": "",
+    }
+    if not (session.supplier_email or "").strip():
+        supplier_result["detail"] = (
+            "No supplier email on file, so the receipt was not sent."
+        )
+    elif not os.environ.get("SUPPLIER_PORTAL_BASE_URL"):
+        supplier_result = {
+            "sent": False,
+            "detail": "SUPPLIER_PORTAL_BASE_URL is unset, so no link could be built.",
+            "recipient": session.supplier_email,
+        }
+    elif notify:
+        try:
+            from services import email as email_service
+
+            supplier_send = email_service.notify_supplier_submission_received(
+                session.supplier_email,
+                session.vendor_name or "",
+                invitation_link(token),
+            )
+            supplier_result = (
+                supplier_send.as_dict()
+                if hasattr(supplier_send, "as_dict")
+                else dict(supplier_send)
+            )
+        except Exception as exc:  # noqa: BLE001 - never lose a submission to mail
+            supplier_result = {
+                "sent": False,
+                "detail": f"{type(exc).__name__}: {exc}",
+                "recipient": session.supplier_email,
+            }
+    else:
+        supplier_result["detail"] = "notification suppressed"
+
+    session.internal = dict(
+        session.internal,
+        notification=result,
+        supplier_notification=supplier_result,
+    )
     _save_session(session)
 
     try:
@@ -2326,6 +2396,18 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
             token=session.token,
             link=link,
         )
+        # The supplier's own receipt, logged beside the buyer's so a failed
+        # send is visible in the same outbox rather than only in the SMTP logs.
+        log_notification(
+            "submission",
+            "Submission received — supplier receipt with status link"
+            + (f": {session.vendor_name}" if session.vendor_name else ""),
+            str(supplier_result.get("recipient") or session.supplier_email or ""),
+            bool(supplier_result.get("sent")),
+            str(supplier_result.get("detail") or ""),
+            token=session.token,
+            link=invitation_link(token),
+        )
     except Exception:
         pass
 
@@ -2336,6 +2418,7 @@ def submit_session(token: str, notify: bool = True) -> Dict[str, Any]:
         "status": session.neutral_status,
         "assessment": summary,
         "notification": result,
+        "supplier_notification": supplier_result,
     }
 
 
@@ -2590,6 +2673,46 @@ def _notify_supplier_decision(
         }
 
     return payload
+
+
+def _notify_supplier_status(session: Session, status: str) -> Dict[str, Any]:
+    """Tell the supplier their status word moved. Never carries a reason.
+
+    Two callers: the MLRO's alert decision and the document re-check. Both
+    change `neutral_status` and both hold buyer-only reasoning for why, so the
+    notice is built from the status word alone — `notify_supplier_status_change`
+    takes no reason parameter, which is what makes leaking one impossible
+    rather than merely unlikely.
+    """
+    if not session.supplier_email:
+        return {
+            "sent": False,
+            "detail": "No supplier email on file, so the status notice was not sent.",
+            "recipient": "",
+        }
+    if not os.environ.get("SUPPLIER_PORTAL_BASE_URL"):
+        return {
+            "sent": False,
+            "detail": "SUPPLIER_PORTAL_BASE_URL is unset, so no link could be built.",
+            "recipient": session.supplier_email,
+        }
+
+    try:
+        from services import email as email_service
+
+        result = email_service.notify_supplier_status_change(
+            session.supplier_email,
+            session.vendor_name or "",
+            status,
+            invitation_link(session.token),
+        )
+        return result.as_dict() if hasattr(result, "as_dict") else dict(result)
+    except Exception as exc:  # noqa: BLE001 - the status change is already saved
+        return {
+            "sent": False,
+            "detail": f"{type(exc).__name__}: {exc}",
+            "recipient": session.supplier_email,
+        }
 
 
 def submission_decision(token: str) -> Optional[Dict[str, Any]]:

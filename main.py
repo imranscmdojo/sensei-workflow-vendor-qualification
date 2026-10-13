@@ -564,12 +564,25 @@ async def auto_fill_endpoint(
             },
         }
 
-    fields = profile_lib.extract_company_fields(result.text)
+    # A data sheet can carry several vendors back to back. The parser reads the
+    # one it leads with, and the officer is told so a form that looks only
+    # partly filled is not mistaken for a parsing failure.
+    records = profile_lib.scenario_count(result.text)
+    if records > 1:
+        result.warnings.append(
+            f"This file holds {records} vendor records, one after another. "
+            "Only the first was read into the form. Upload one vendor per file "
+            "so the rest are not lost."
+        )
+
+    sections: Dict[str, List[Dict[str, str]]] = {}
+    fields = profile_lib.extract_company_fields(result.text, sections=sections)
     return {
         "status": "success",
         "data": {
             "extracted": True,
             "fields": [f.to_dict() for f in fields],
+            "sections": sections,
             "pages": result.pages,
             "chars_read": result.chars,
             "warnings": result.warnings,
@@ -981,6 +994,16 @@ async def supplier_portal_upload_document(
             "Document re-check: corrected upload received — status moved "
             "from Action required to Under review."
         )
+        # The supplier moved their own submission forward, so tell them it
+        # landed rather than making them refresh to find out. Status word
+        # only: the internal note above is the buyer's, not theirs. Wrapped
+        # because an upload must never fail on an outbound mail.
+        try:
+            supplier_status = supplier_portal._notify_supplier_status(
+                session, "Under review"
+            )
+        except Exception:  # noqa: BLE001 - the status move is the contract
+            supplier_status = {"sent": False, "detail": "notice skipped", "recipient": ""}
         try:
             log_notification(
                 "recheck",
@@ -990,6 +1013,18 @@ async def supplier_portal_upload_document(
                 recheck,
                 token=token,
                 link=supplier_portal.report_link(token),
+            )
+            # The supplier's own notice, logged beside the buyer's so a failed
+            # send shows in the same outbox rather than only in the SMTP logs.
+            log_notification(
+                "recheck",
+                "Corrected upload received — supplier status notice"
+                + (f": {session.vendor_name}" if session.vendor_name else ""),
+                str(supplier_status.get("recipient") or session.supplier_email or ""),
+                bool(supplier_status.get("sent")),
+                str(supplier_status.get("detail") or ""),
+                token=token,
+                link=supplier_portal.invitation_link(token),
             )
         except Exception:  # noqa: BLE001 - the status move is the contract
             pass

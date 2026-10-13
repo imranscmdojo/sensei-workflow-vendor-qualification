@@ -2320,6 +2320,21 @@ class SubmissionDecisionTest(unittest.TestCase):
         )
 
 
+class _FakeSend:
+    """A send that reports success without touching SMTP.
+
+    The per-test `FakeResult` classes below predate it and are left alone; this
+    is for the tests that only need the call captured and a sane result back.
+    """
+
+    sent = True
+    detail = "sent"
+    recipient = "applicant@example.com"
+
+    def as_dict(self):
+        return {"sent": True, "detail": "sent", "recipient": self.recipient}
+
+
 class SupplierNotificationTest(unittest.TestCase):
     """Mail to the supplier: the invitation, and the outcome.
 
@@ -2577,6 +2592,186 @@ class SupplierNotificationTest(unittest.TestCase):
                            "weighted_risk_score", "score", "appendix f"):
                 self.assertNotIn(banned, blob, f"{banned!r} leaked into supplier mail")
         self.assertIn("trade licence expired", text)
+
+    def test_a_rejection_without_a_reason_still_reads_correctly(self):
+        """The approval brief carries no justification field.
+
+        Printing "the following changes:" above an empty quote would read as a
+        bug to the supplier, so the mail says what to do instead.
+        """
+        from services import email as email_service
+        text = email_service.decision_body("Apex Gulf LLC", False, "", "https://x/y")
+        html = email_service.decision_html("Apex Gulf LLC", False, "", "https://x/y")
+        self.assertNotIn("following changes", text)
+        self.assertNotIn("following changes", html)
+        self.assertNotIn("<em></em>", html)
+        self.assertIn("Open your form to see what needs changing", text)
+        self.assertIn("Open your form to see what needs changing", html)
+
+    def test_an_approval_brief_decision_notifies_the_supplier(self):
+        """Gap 1: the brief route must not be quieter than the button route.
+
+        The same approve/reject reached the supplier when the reviewer clicked
+        a button and stayed silent when they clicked an emailed brief.
+        """
+        from services import email as email_service
+
+        token = supplier_portal.issue_token(
+            "Brief Co", invited_by="owner@firm.com", supplier_email="brief@example.com")
+        brief = supplier_portal.create_approval_brief(
+            "Brief Co", "summary", "owner@firm.com", supplier_token=token)
+
+        captured = {}
+        original = email_service.notify_supplier_decision
+        email_service.notify_supplier_decision = lambda *a, **k: (
+            captured.update(args=a) or _FakeSend())
+        try:
+            os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.example.com"
+            supplier_portal.record_approval_decision(brief, "rejected", "owner@firm.com")
+        finally:
+            email_service.notify_supplier_decision = original
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+
+        self.assertEqual(captured["args"][0], "brief@example.com")
+        self.assertFalse(captured["args"][2], "approved flag should be False")
+        self.assertIn("/supplier/onboarding/", captured["args"][4])
+        self.assertEqual(
+            supplier_portal._load_session(token).neutral_status, "Action required")
+
+    def test_an_mlro_alert_decision_notifies_the_supplier(self):
+        """Gap 2: the status word moves, so the supplier must be told it did.
+
+        Not why — the MLRO's justification stays internal, and this asserts
+        that too.
+        """
+        from services import email as email_service
+
+        token = supplier_portal.issue_token(
+            "Alert Co", invited_by="owner@firm.com", supplier_email="alert@example.com")
+        supplier_portal.create_compliance_alert(
+            "alert-notify-1", "Alert Co", "CONFIDENTIAL MLRO REASON", token)
+
+        captured = {}
+        original = email_service.notify_supplier_status_change
+        email_service.notify_supplier_status_change = lambda *a, **k: (
+            captured.update(args=a) or _FakeSend())
+        try:
+            os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.example.com"
+            supplier_portal.decide_compliance_alert(
+                "alert-notify-1", "rejected", {"email": "mlro@firm.com", "role": "mlro"})
+        finally:
+            email_service.notify_supplier_status_change = original
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+
+        self.assertEqual(captured["args"][0], "alert@example.com")
+        self.assertEqual(captured["args"][2], "Action required")
+        self.assertNotIn("CONFIDENTIAL", str(captured["args"]))
+        self.assertEqual(
+            supplier_portal._load_session(token).neutral_status, "Action required")
+
+    def test_the_status_change_mail_carries_no_reason_at_all(self):
+        """The template has no reason parameter, so none can be passed in."""
+        from services import email as email_service
+        text = email_service.status_change_body(
+            "Apex Gulf LLC", "Action required", "https://x/y")
+        html = email_service.status_change_html(
+            "Apex Gulf LLC", "Action required", "https://x/y")
+        for blob in (text.lower(), html.lower()):
+            for banned in ("risk tier", "high risk", "medium risk", "edd",
+                           "weighted_risk_score", "score", "appendix f",
+                           "sanctions", "screening", "alert"):
+                self.assertNotIn(banned, blob, f"{banned!r} leaked into supplier mail")
+        self.assertIn("needs your attention", text)
+
+        cleared = email_service.status_change_body(
+            "Apex Gulf LLC", "Under review", "https://x/y")
+        self.assertIn("under review", cleared)
+        self.assertIn("nothing further for you to do", cleared)
+
+    def test_a_corrected_upload_notifies_the_supplier(self):
+        """Gap 3: the supplier moved their own submission forward; say so."""
+        from services import email as email_service
+
+        token = supplier_portal.issue_token(
+            "Recheck Co", invited_by="owner@firm.com", supplier_email="recheck@example.com")
+        session = supplier_portal._load_session(token)
+        session.form.update({k: v for k, v in vendor_c_form().items()
+                             if k in supplier_portal.SUPPLIER_VISIBLE_FORM_FIELDS})
+        session.submitted_at = 1.0
+        session.neutral_status = "Action required"
+        supplier_portal._save_session(session)
+
+        captured = {}
+        original = email_service.notify_supplier_status_change
+        email_service.notify_supplier_status_change = lambda *a, **k: (
+            captured.update(args=a) or _FakeSend())
+        try:
+            os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.example.com"
+            result = supplier_portal._notify_supplier_status(
+                supplier_portal._load_session(token), "Under review")
+        finally:
+            email_service.notify_supplier_status_change = original
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(captured["args"][0], "recheck@example.com")
+        self.assertEqual(captured["args"][2], "Under review")
+        self.assertIn("/supplier/onboarding/", captured["args"][3])
+
+    def test_a_status_notice_without_an_address_is_reported_not_raised(self):
+        """No supplier email on file is a reported outcome, never an exception."""
+        token = supplier_portal.issue_token("NoAddr Co", invited_by="o@firm.com")
+        os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.example.com"
+        try:
+            result = supplier_portal._notify_supplier_status(
+                supplier_portal._load_session(token), "Under review")
+        finally:
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+        self.assertFalse(result["sent"])
+        self.assertIn("No supplier email on file", result["detail"])
+
+    def test_a_corrected_upload_through_the_endpoint_notifies_the_supplier(self):
+        """Gap 3, end to end: the route, not just the helper it calls.
+
+        A sent-back supplier who uploads a fixed document is acting on a
+        rejection. Their status moves forward and the mail has to follow it,
+        through the same route the browser uses.
+        """
+        from services import email as email_service
+
+        token = supplier_portal.issue_token(
+            "Endpoint Recheck Co", invited_by="owner@firm.com",
+            supplier_email="endpoint@example.com")
+        session = supplier_portal._load_session(token)
+        session.form.update({k: v for k, v in vendor_c_form().items()
+                             if k in supplier_portal.SUPPLIER_VISIBLE_FORM_FIELDS})
+        supplier_portal._save_session(session)
+        supplier_portal.submit_session(token, notify=False)
+        supplier_portal._load_session(token).neutral_status = "Action required"
+        supplier_portal._save_session(supplier_portal._load_session(token))
+
+        captured = {}
+        original = email_service.notify_supplier_status_change
+        email_service.notify_supplier_status_change = lambda *a, **k: (
+            captured.update(args=a) or _FakeSend())
+        try:
+            os.environ["SUPPLIER_PORTAL_BASE_URL"] = "https://portal.example.com"
+            client = TestClient(main.app)
+            uploaded = client.post(
+                f"/api/supplier/{token}/documents",
+                files={"file": ("trade-licence.pdf", io.BytesIO(_LICENCE_PDF),
+                                "application/pdf")},
+                params={"document_code": "62"},
+            )
+        finally:
+            email_service.notify_supplier_status_change = original
+            os.environ.pop("SUPPLIER_PORTAL_BASE_URL", None)
+
+        # The upload is the contract: it must succeed whether or not mail did.
+        self.assertEqual(uploaded.status_code, 200, uploaded.text)
+        self.assertEqual(uploaded.json()["status"], "Under review")
+        self.assertEqual(captured["args"][0], "endpoint@example.com")
+        self.assertEqual(captured["args"][2], "Under review")
 
 if __name__ == "__main__":
     unittest.main()

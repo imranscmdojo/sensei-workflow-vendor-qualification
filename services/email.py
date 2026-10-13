@@ -291,12 +291,22 @@ def decision_body(
         + ".\n\n",
     ]
     if not approved:
-        lines.append(
-            "The reviewer has asked for the following changes:\n\n"
-            f"  {reason}\n\n"
-            "Open your form, make those changes and submit again:\n"
-            f"{link}\n\n"
-        )
+        # A reason is not always available. The approval-brief route records an
+        # outcome without a justification field, and printing "the following
+        # changes:" above an empty line reads as a bug to the supplier. Say the
+        # same thing without the empty quote in that case.
+        if (reason or "").strip():
+            lines.append(
+                "The reviewer has asked for the following changes:\n\n"
+                f"  {reason}\n\n"
+                "Open your form, make those changes and submit again:\n"
+                f"{link}\n\n"
+            )
+        else:
+            lines.append(
+                "Open your form to see what needs changing, then submit it "
+                f"again:\n{link}\n\n"
+            )
     else:
         lines.append(
             "There is nothing further for you to do. Your form and documents are\n"
@@ -317,16 +327,21 @@ def decision_html(
 ) -> str:
     esc = _escape(vendor_name)
     who = f" for <strong>{esc}</strong>" if vendor_name else ""
-    paragraphs = (
-        ["There is nothing further for you to do. Your form and documents are on "
-         "file with the reviewer."]
-        if approved
-        else [
+    if approved:
+        paragraphs = (
+            ["There is nothing further for you to do. Your form and documents are on "
+             "file with the reviewer."]
+        )
+    elif (reason or "").strip():
+        paragraphs = [
             "The reviewer has asked for the following changes:",
             f"<em>{_escape(reason)}</em>",
             "Open your form, make those changes and submit again.",
         ]
-    )
+    else:
+        # Same gap as the text half: a decision recorded without a justification
+        # must not render an empty quote block.
+        paragraphs = ["Open your form to see what needs changing, then submit it again."]
     return _shell(
         eyebrow="Vendor onboarding",
         heading=(
@@ -347,6 +362,138 @@ def notify_supplier_invitation(to: str, vendor_name: str, link: str) -> SendResu
         f"{SUBJECT.split(':')[0]}: please complete your onboarding form",
         invitation_body(vendor_name, link),
         invitation_html(vendor_name, link),
+        use_override=False,
+    )
+
+
+def submission_confirmation_body(vendor_name: str, link: str) -> str:
+    """Plain-text receipt for the supplier's own submission."""
+    who = f" for {vendor_name}" if vendor_name else ""
+    return (
+        "Hello,\n\n"
+        f"We have received your vendor onboarding submission{who}.\n\n"
+        "It is now with the reviewer. You do not need to do anything else — "
+        "if anything needs changing, the reviewer will come back to you.\n\n"
+        "Check its status at any time:\n"
+        f"{link}\n"
+    )
+
+
+def submission_confirmation_html(vendor_name: str, link: str) -> str:
+    """The receipt as the supplier sees it: the card, with a status button."""
+    esc = _escape(vendor_name)
+    who = f" for <strong>{esc}</strong>" if vendor_name else ""
+    return _shell(
+        eyebrow="Vendor onboarding",
+        heading=f"We have received your submission{who}",
+        paragraphs=[
+            "It is now with the reviewer. There is nothing further for you to do "
+            "right now — if anything needs changing, the reviewer will contact "
+            "you.",
+            "You can come back at any time to see where your submission stands.",
+        ],
+        cta="View status",
+        link=link,
+        accent="#0f7b3d",
+    )
+
+
+def notify_supplier_submission_received(
+    to: str, vendor_name: str, link: str
+) -> SendResult:
+    """The supplier's receipt, sent the moment they submit.
+
+    Separate from the buyer's submission notice, which reports the assessment
+    to the inviter. This one confirms only that the form landed and points at
+    the supplier's own status page — no tier, no score, nothing the neutral
+    firewall keeps from them.
+    """
+    return send(
+        to,
+        "Your vendor onboarding submission has been received"
+        + (f" — {vendor_name}" if vendor_name else ""),
+        submission_confirmation_body(vendor_name, link),
+        submission_confirmation_html(vendor_name, link),
+        use_override=False,
+    )
+
+
+def status_change_body(vendor_name: str, status: str, link: str) -> str:
+    """Plain-text notice that the supplier's status moved.
+
+    Carries the status word and nothing else. The MLRO's justification and the
+    re-check's internal note are both buyer-side reasoning, and both would break
+    the neutral firewall if they travelled — so this template has no `reason`
+    parameter at all, rather than one the caller has to remember to leave empty.
+    """
+    who = f" for {vendor_name}" if vendor_name else ""
+    if status == "Action required":
+        lead = (
+            "Your vendor onboarding submission needs your attention"
+            f"{who}.\n\n"
+            "Open your form to see what is being asked, then update and "
+            "resubmit it.\n\n"
+        )
+    else:
+        lead = (
+            "Your vendor onboarding submission is now under review"
+            f"{who}.\n\n"
+            "There is nothing further for you to do right now. We will contact "
+            "you if anything is needed.\n\n"
+        )
+    return (
+        "Hello,\n\n"
+        f"{lead}"
+        "Check its status at any time:\n"
+        f"{link}\n"
+    )
+
+
+def status_change_html(vendor_name: str, status: str, link: str) -> str:
+    """The status notice as the supplier sees it, with a status button."""
+    esc = _escape(vendor_name)
+    who = f" for <strong>{esc}</strong>" if vendor_name else ""
+    action = status == "Action required"
+    return _shell(
+        eyebrow="Vendor onboarding",
+        heading=(
+            "Your submission needs your attention" if action
+            else "Your submission is now under review"
+        ) + who,
+        paragraphs=(
+            [
+                "Open your form to see what is being asked, then update and "
+                "resubmit it.",
+            ]
+            if action
+            else [
+                "There is nothing further for you to do right now. We will "
+                "contact you if anything is needed.",
+            ]
+        ),
+        cta="Open your form" if action else "View status",
+        link=link,
+        accent="#8a5a00" if action else "#0f7b3d",
+    )
+
+
+def notify_supplier_status_change(
+    to: str, vendor_name: str, status: str, link: str
+) -> SendResult:
+    """Tell the supplier their status moved, and nothing about why.
+
+    Two callers: the MLRO's alert decision, and the document re-check that
+    moves a sent-back submission forward again. Both change `neutral_status`
+    silently today, which leaves a supplier staring at a page whose status
+    word flipped with no mail explaining that it did.
+    """
+    verb = "needs your attention" if status == "Action required" else "is under review"
+    return send(
+        to,
+        f"Your vendor onboarding submission {verb}"
+        + (f" — {vendor_name}" if vendor_name else ""),
+        status_change_body(vendor_name, status, link),
+        status_change_html(vendor_name, status, link),
         use_override=False,
     )
 
