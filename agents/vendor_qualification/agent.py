@@ -36,6 +36,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -1045,10 +1046,19 @@ contain is omitted, not invented."""
         """
         form = form if isinstance(form, dict) else {}
 
+        # Wall-clock stamps per phase. Observed report runs span 70s to 391s
+        # and there was no way to tell a slow retrieval pass from a slow
+        # narrative — only that the whole thing had been slow.
+        run_started = time.monotonic()
+
         yield {"type": "stage", "stage": "validation",
                "label": "Validating NH-PQF-001 submission"}
 
         context = self.retrieve_policy_facts(form)
+        LOGGER.info(
+            "[vendor_qualification] retrieval %.1fs",
+            time.monotonic() - run_started,
+        )
 
         if context.get("blocked"):
             report = context["report"]
@@ -1120,6 +1130,10 @@ contain is omitted, not invented."""
 
         assessment, override = self.assess(signal_bag)
         score, tier, dd_level, cycle = self._final_score_tier(assessment, override)
+        LOGGER.info(
+            "[vendor_qualification] scoring %.1fs",
+            time.monotonic() - run_started,
+        )
 
         yield {
             "type": "score",
@@ -1144,6 +1158,11 @@ contain is omitted, not invented."""
         }
 
         narrative = await self._generate_narrative(form, signal_bag, assessment, override)
+        LOGGER.info(
+            "[vendor_qualification] narrative %.1fs (present=%s)",
+            time.monotonic() - run_started,
+            narrative is not None,
+        )
         if narrative is None:
             yield {
                 "type": "error",
@@ -1163,6 +1182,10 @@ contain is omitted, not invented."""
             override=override,
             citation_list=citation_list,
             retrieval_available=bool(citation_list or chunks),
+        )
+        LOGGER.info(
+            "[vendor_qualification] dossier complete; total %.1fs",
+            time.monotonic() - run_started,
         )
 
         yield {"type": "dossier", "dossier": dossier}

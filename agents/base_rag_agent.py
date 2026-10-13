@@ -26,6 +26,7 @@ RAG_CORPUS at a dedicated corpus later is a one-variable change.
 
 import os
 import json
+import asyncio
 import json5
 import dirtyjson
 import regex as re
@@ -307,8 +308,17 @@ class BaseRAGAgent:
         )
 
         for attempt in (1, 2):
-            response = model.generate_content(prompt,
-                                              generation_config=generation_config)
+            # `generate_content` is a blocking gRPC call. Awaited directly it
+            # pins the event loop for the whole generation — minutes, on a
+            # narrative run — so every other request the worker is serving
+            # stalls behind one vendor's assessment. Handing it to a thread
+            # gives the loop back to the server; the attempts are sequential
+            # either way, so this changes no output.
+            response = await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config=generation_config,
+            )
 
             # Usage tracking — best-effort, never breaks generation
             try:
