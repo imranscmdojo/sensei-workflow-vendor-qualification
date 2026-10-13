@@ -2908,12 +2908,19 @@ class SupplierNotificationTest(unittest.TestCase):
         self.assertFalse(result["sent"])
         self.assertIn("No supplier email on file", result["detail"])
 
-    def test_a_corrected_upload_through_the_endpoint_notifies_the_supplier(self):
+    def test_a_corrected_upload_keeps_the_supplier_able_to_send_it_back(self):
         """Gap 3, end to end: the route, not just the helper it calls.
 
-        A sent-back supplier who uploads a fixed document is acting on a
-        rejection. Their status moves forward and the mail has to follow it,
-        through the same route the browser uses.
+        A sent-back supplier who uploads a fixed document is working on the
+        rejection, not answering it. The upload used to move the status to
+        "Under review", which is read-only — the wizard swapped itself for the
+        status tracker, the document step vanished under the supplier, and the
+        Submit they then hunted down was refused as a duplicate. The buyer
+        never learned the file had come back, and the supplier was stuck on the
+        page in the bug report.
+
+        The status stays "Action required" so the form is still editable and
+        the press of "Send response" is what resubmits.
         """
         from services import email as email_service
 
@@ -2925,8 +2932,8 @@ class SupplierNotificationTest(unittest.TestCase):
                              if k in supplier_portal.SUPPLIER_VISIBLE_FORM_FIELDS})
         supplier_portal._save_session(session)
         supplier_portal.submit_session(token, notify=False)
-        supplier_portal._load_session(token).neutral_status = "Action required"
-        supplier_portal._save_session(supplier_portal._load_session(token))
+        supplier_portal.record_submission_decision(
+            token, "rejected", "owner@firm.com", "The trade licence expired.")
 
         captured = {}
         original = email_service.notify_supplier_status_change
@@ -2947,9 +2954,14 @@ class SupplierNotificationTest(unittest.TestCase):
 
         # The upload is the contract: it must succeed whether or not mail did.
         self.assertEqual(uploaded.status_code, 200, uploaded.text)
-        self.assertEqual(uploaded.json()["status"], "Under review")
-        self.assertEqual(captured["args"][0], "endpoint@example.com")
-        self.assertEqual(captured["args"][2], "Under review")
+        self.assertEqual(uploaded.json()["status"], "Action required")
+        # Nothing has gone back to the buyer yet, so no "Under review" mail.
+        self.assertNotIn("args", captured)
+
+        # And the button they were sent back to press still works.
+        out = supplier_portal.submit_session(token, notify=False)
+        self.assertTrue(out["resubmitted"])
+        self.assertEqual(out["status"], "Under review")
 
 if __name__ == "__main__":
     unittest.main()

@@ -978,56 +978,43 @@ async def supplier_portal_upload_document(
             detail="Upload a PDF or a .docx file.",
         )
 
-    # State machine sync. A document uploaded against a sent-back submission
-    # is the supplier acting on the rejection: extraction above already ran
-    # the re-check (it reconciles the new file with the form and raises
-    # clarifications where they disagree), so the vendor moves back to the
-    # buyer's queue — ACTION_REQUIRED → UNDER_REVIEW in the status machine's
-    # vocabulary — instead of sitting in "Action required" with nobody watching.
+    # An upload against a sent-back submission is the supplier working on the
+    # rejection, not yet answering it. Extraction above has already re-run the
+    # check — it reconciles the new file with the form and raises clarifications
+    # where they disagree — so the record is current either way.
+    #
+    # The status deliberately does not move. "Action required" is what keeps the
+    # form editable, keeps the wizard sitting on the document step, and keeps
+    # the panel that says "press Send response" on screen. Moving it to "Under
+    # review" here threw the supplier onto the read-only status page with no
+    # Submit button left to press — and then, having found one, that Submit was
+    # refused as a duplicate, so the buyer never learned the file had come back.
+    # Sending it back is the press of that button and only that: it re-scores
+    # the form and notifies the inviter, which an upload on its own must not
+    # pretend to have done.
     recheck: str | None = None
     if (
         session.submitted_at is not None
         and session.neutral_status == "Action required"
     ):
-        session.neutral_status = "Under review"
-        supplier_portal._save_session(session)
         recheck = (
-            "Document re-check: corrected upload received — status moved "
-            "from Action required to Under review."
+            "Document re-check: corrected upload received — still awaiting "
+            "the supplier's response."
         )
-        # The supplier moved their own submission forward, so tell them it
-        # landed rather than making them refresh to find out. Status word
-        # only: the internal note above is the buyer's, not theirs. Wrapped
-        # because an upload must never fail on an outbound mail.
-        try:
-            supplier_status = supplier_portal._notify_supplier_status(
-                session, "Under review"
-            )
-        except Exception:  # noqa: BLE001 - the status move is the contract
-            supplier_status = {"sent": False, "detail": "notice skipped", "recipient": ""}
+        # An outbox note for the buyer, not a mail: nothing has gone back to
+        # them yet, and saying otherwise would be untrue. Wrapped because an
+        # upload must never fail on a log write.
         try:
             log_notification(
                 "recheck",
-                f"Document re-check: {session.vendor_name or 'A vendor'} — back under review",
+                f"Document re-check: {session.vendor_name or 'A vendor'} — corrected upload received, awaiting their response",
                 session.invited_by or "",
                 False,
                 recheck,
                 token=token,
                 link=supplier_portal.report_link(token),
             )
-            # The supplier's own notice, logged beside the buyer's so a failed
-            # send shows in the same outbox rather than only in the SMTP logs.
-            log_notification(
-                "recheck",
-                "Corrected upload received — supplier status notice"
-                + (f": {session.vendor_name}" if session.vendor_name else ""),
-                str(supplier_status.get("recipient") or session.supplier_email or ""),
-                bool(supplier_status.get("sent")),
-                str(supplier_status.get("detail") or ""),
-                token=token,
-                link=supplier_portal.invitation_link(token),
-            )
-        except Exception:  # noqa: BLE001 - the status move is the contract
+        except Exception:  # noqa: BLE001 - the upload is the contract
             pass
 
     return {
