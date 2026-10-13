@@ -2465,6 +2465,38 @@ class ReviewLinkDecisionTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def test_the_buyers_own_decision_survives_their_auditor_deciding(self):
+        """The buyer approved first; the auditor's approval must not erase it.
+
+        The bar headlines only the latest decision, so recording a second one
+        used to make the first look as though it had never happened. The backend
+        has always appended — this pins that, and that both entries stay
+        distinguishable.
+        """
+        buyer = self.client.post(
+            f"/api/portal/submissions/{self.token}/decision",
+            json={"decision": "approved", "justification": "Cleared by procurement."},
+            headers={"Authorization": "Bearer owner@firm.com"},
+        )
+        self.assertEqual(buyer.status_code, 200, buyer.text)
+        self._decide()  # the auditor, from the link, with no auth header
+
+        view = supplier_portal.buyer_view(self.token)
+        history = view["decision_history"]
+        self.assertEqual(len(history), 2, history)
+        self.assertEqual(
+            [d["decided_by"] for d in history],
+            ["auth-disabled", "Imran Manager (manager01@mailinator.com)"],
+        )
+        self.assertEqual(history[0]["justification"], "Cleared by procurement.")
+        self.assertEqual(history[0]["source"], "")
+        self.assertEqual(history[1]["source"], "review_invite")
+        # The headline moves on to the newest; only the trail keeps the first.
+        self.assertEqual(
+            view["decision"]["decided_by"],
+            "Imran Manager (manager01@mailinator.com)",
+        )
+
 
 class _FakeSend:
     """A send that reports success without touching SMTP.
