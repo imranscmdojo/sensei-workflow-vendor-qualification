@@ -47,6 +47,12 @@ trap 'rm -f "$ENV_FILE"' EXIT
   # reach production. SMTP credentials come from .env (never the repo).
   echo "SUPPLIER_PORTAL_BASE_URL: \"https://nh.scmsensei.ai\""
   echo "SUPPLIER_PORTAL_DB: \"/tmp/supplier_portal.db\""
+  # The shared snapshot of that same file. Without it, `/tmp` dies with the
+  # container: every deploy and every scale-to-zero cold start came up holding
+  # an empty store, and a buyer saw that as a supplier invitation link that
+  # "expired" minutes after it was sent. The TTL was never the fault — it is
+  # two weeks. See `_gs_*` in supplier_portal.py.
+  echo "SUPPLIER_PORTAL_DB_GS: \"gs://test-rag-corpus-project-supplier-portal/supplier_portal.db\""
   echo "SMTP_HOST: \"${SMTP_HOST:-}\""
   echo "SMTP_PORT: \"${SMTP_PORT:-587}\""
   echo "SMTP_USER: \"${SMTP_USER:-}\""
@@ -65,6 +71,7 @@ gcloud run deploy "$SERVICE_NAME" \
   --memory 2Gi \
   --cpu 2 \
   --min-instances 0 \
+  --max-instances 1 \
   --concurrency 40 \
   --timeout 3600 \
   --env-vars-file "$ENV_FILE"

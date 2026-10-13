@@ -192,27 +192,164 @@ _ITEMS: Dict[str, Dict[str, Any]] = {}
 _ITEMS_LOCK = threading.Lock()
 
 
+# --------------------------------------------------------------------------
+# Shared snapshot — the fix for links that "expired" minutes after they were
+# sent.
+#
+# Cloud Run gives every revision its own writable layer and `/tmp` dies with
+# the container, so a deploy, a scale-to-zero cold start, or a second replica
+# all come up holding an empty store. A buyer sees that as a supplier link that
+# stopped working almost immediately; the TTL was never the fault,
+# `TOKEN_TTL_SECONDS` is two weeks.
+#
+# `SUPPLIER_PORTAL_DB_GS` names a Cloud Storage object holding a snapshot of
+# the very same SQLite file. The local file stays the fast path and SQLite
+# stays the record of truth; the snapshot is pulled once when a container comes
+# up without one and pushed after every committed write. GCS replaces an object
+# atomically, so a reader never sees a half-written database. The service runs
+# with `--max-instances 1`, which is what keeps there to be one writer and so
+# no snapshot to reconcile.
+# --------------------------------------------------------------------------
+
+_GS_URI = os.environ.get("SUPPLIER_PORTAL_DB_GS", "").strip()
+_GS_LOCK = threading.Lock()
+_GS_PUSHING = False
+_GS_DIRTY = False
+_DB_INIT_LOCK = threading.Lock()
+
+
+def _gs_blob() -> Any:
+    """The snapshot object, or None when snapshots are not configured."""
+    if not _GS_URI.startswith("gs://"):
+        return None
+    bucket_name, _, blob_name = _GS_URI[len("gs://"):].partition("/")
+    if not bucket_name or not blob_name:
+        return None
+    try:
+        from google.cloud import storage
+
+        return storage.Client().bucket(bucket_name).blob(blob_name)
+    except Exception:  # noqa: BLE001 - a snapshot problem must never take the portal down
+        return None
+
+
+def _gs_restore() -> None:
+    """Pull the shared snapshot into a container that has none of its own.
+
+    Runs before the first `connect`, so a fresh container opens a database that
+    already holds every live invitation. A container that restarted alongside
+    its own file keeps that file: it is newer than the snapshot it last wrote.
+    """
+    if not _DB_PATH:
+        return
+    if os.path.exists(_DB_PATH) and os.path.getsize(_DB_PATH) > 0:
+        return
+    blob = _gs_blob()
+    if blob is None:
+        return
+    try:
+        if blob.exists():
+            blob.download_to_filename(_DB_PATH)
+    except Exception:  # noqa: BLE001 - an empty store is the fallback, not a failure
+        pass
+
+
+def _gs_push_once() -> None:
+    """Snapshot the live database to Cloud Storage.
+
+    `Connection.backup` is what makes this safe: it copies pages under SQLite's
+    own locking rules, so the snapshot is consistent even if another thread is
+    mid-transaction. Reading the file outright would not be.
+    """
+    blob = _gs_blob()
+    db = _db()
+    if blob is None or db is None:
+        return
+    import sqlite3
+
+    tmp_path = f"{_DB_PATH}.snapshot"
+    out: Any = None
+    try:
+        out = sqlite3.connect(tmp_path)
+        with _DB_LOCK:
+            db.backup(out)
+        out.commit()
+        out.close()
+        out = None
+        blob.upload_from_filename(tmp_path)
+    except Exception:  # noqa: BLE001 - a failed snapshot must not fail the save
+        pass
+    finally:
+        if out is not None:
+            try:
+                out.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _gs_schedule_push() -> None:
+    """Queue a snapshot, coalescing a burst of writes into a single upload.
+
+    Every save calls this. Uploading per save would put a network round trip
+    inside a request; instead one worker waits a beat, snapshots whatever the
+    database looks like then, and keeps looping while writes keep arriving.
+    """
+    global _GS_PUSHING, _GS_DIRTY
+    if not _GS_URI:
+        return
+    with _GS_LOCK:
+        _GS_DIRTY = True
+        if _GS_PUSHING:
+            return
+        _GS_PUSHING = True
+    threading.Thread(target=_gs_push_loop, daemon=True, name="portal-snapshot").start()
+
+
+def _gs_push_loop() -> None:
+    global _GS_PUSHING, _GS_DIRTY
+    while True:
+        time.sleep(2.0)
+        with _GS_LOCK:
+            if not _GS_DIRTY:
+                _GS_PUSHING = False
+                return
+            _GS_DIRTY = False
+        _gs_push_once()
+
+
 def _db() -> Any:
     """Lazily open the store. Returns None when durability is not configured."""
     global _DB
     if not _DB_PATH:
         return None
     if _DB is None:
-        import sqlite3
+        with _DB_INIT_LOCK:
+            if _DB is None:
+                # Before the first connect: a container that just started has
+                # an empty `/tmp`, and this is what gives it back every live
+                # invitation instead of a portal that 404s every link.
+                _gs_restore()
+                import sqlite3
 
-        _DB = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        _DB.execute("PRAGMA journal_mode=WAL")
-        _DB.execute(
-            "CREATE TABLE IF NOT EXISTS portal_sessions ("
-            "token TEXT PRIMARY KEY, created_at REAL NOT NULL, data TEXT NOT NULL)"
-        )
-        _DB.execute(
-            "CREATE TABLE IF NOT EXISTS portal_items ("
-            "kind TEXT NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL,"
-            "PRIMARY KEY (kind, key))"
-        )
-        _DB.commit()
-        _restore()
+                _DB = sqlite3.connect(_DB_PATH, check_same_thread=False)
+                _DB.execute("PRAGMA journal_mode=WAL")
+                _DB.execute(
+                    "CREATE TABLE IF NOT EXISTS portal_sessions ("
+                    "token TEXT PRIMARY KEY, created_at REAL NOT NULL, data TEXT NOT NULL)"
+                )
+                _DB.execute(
+                    "CREATE TABLE IF NOT EXISTS portal_items ("
+                    "kind TEXT NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL,"
+                    "PRIMARY KEY (kind, key))"
+                )
+                _DB.commit()
+                _restore()
+                # Boot purged expired rows; make the snapshot agree with that.
+                _gs_schedule_push()
     return _DB
 
 
@@ -253,6 +390,7 @@ def _persist_session(session: Session) -> None:
             ),
         )
         db.commit()
+    _gs_schedule_push()
 
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
@@ -288,6 +426,7 @@ def _persist_item(kind: str, key: str, payload: Dict[str, Any]) -> None:
             (kind, key, json.dumps(payload, default=str)),
         )
         db.commit()
+    _gs_schedule_push()
 
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
@@ -3067,6 +3206,7 @@ def delete_invitation(token: str) -> Dict[str, Any]:
                     )
             db.execute("DELETE FROM portal_sessions WHERE token = ?", (token,))
             db.commit()
+        _gs_schedule_push()
 
     # The caches are the live view: rows deleted only on disk would keep
     # showing in the console until the next restart.

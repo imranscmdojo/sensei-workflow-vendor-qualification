@@ -3141,3 +3141,67 @@ class ResubmissionTest(unittest.TestCase):
                          "The trade licence expired last month.")
         # The assessment is the part that is supposed to be recomputed.
         self.assertIsNotNone(after["assessment"]["weighted_risk_score"])
+
+
+class PortalSnapshotTest(unittest.TestCase):
+    """A link must outlive the container it was created in.
+
+    Cloud Run gives each revision its own writable layer and `/tmp` dies with
+    the container, so a deploy or a scale-to-zero cold start came up holding an
+    empty store. A buyer experienced that as a supplier invitation that
+    "expired" minutes after it was sent — `TOKEN_TTL_SECONDS` is two weeks; the
+    store was the thing that expired. Run in a subprocess for the same reason
+    as LinkSurvivesRestartTest: a fresh interpreter is the nearest thing to a
+    fresh container.
+    """
+
+    _FAKE = """
+        import os, shutil, supplier_portal as sp
+        class _FakeBlob:
+            def __init__(self, path): self.path = path
+            def exists(self): return os.path.exists(self.path)
+            def download_to_filename(self, path): shutil.copyfile(self.path, path)
+            def upload_from_filename(self, path): shutil.copyfile(path, self.path)
+        sp._GS_URI = "gs://portal-snapshots/supplier_portal.db"
+        sp._gs_blob = lambda: _FakeBlob({snap!r})
+    """
+
+    def _run(self, db: str, snap: str, code: str) -> str:
+        env = dict(os.environ, SUPPLIER_PORTAL_DB=db, AUTH_DISABLED="true")
+        env.pop("SUPPLIER_PORTAL_DB_GS", None)
+        script = textwrap.dedent(self._FAKE).format(snap=snap) + textwrap.dedent(code)
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, env=env, timeout=120,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        self.assertEqual(out.returncode, 0, out.stderr[-1500:])
+        return out.stdout.strip()
+
+    def test_a_link_comes_back_to_a_container_that_started_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "portal.db")
+            snap = os.path.join(tmp, "portal.db.shared")
+
+            token = self._run(db, snap, """
+                token = sp.issue_token("Apex Gulf Technical Solutions LLC")
+                session = sp._load_session(token)
+                session.form["country_of_incorporation"] = "UAE"
+                sp._save_session(session)
+                sp._gs_push_once()      # the coalescing worker, run to completion
+                print(token)
+            """)
+            self.assertTrue(token)
+            self.assertTrue(os.path.exists(snap), "no shared snapshot was written")
+
+            # The container is gone, and its whole `/tmp` with it.
+            os.remove(db)
+            self.assertFalse(os.path.exists(db))
+
+            view = self._run(db, snap, f"""
+                import json
+                print(json.dumps(sp.supplier_view(sp._load_session({token!r}))))
+            """)
+            data = json.loads(view)
+            self.assertEqual(data["vendor_name"], "Apex Gulf Technical Solutions LLC")
+            self.assertEqual(data["form"]["country_of_incorporation"], "UAE")
