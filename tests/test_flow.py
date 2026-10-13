@@ -2320,6 +2320,152 @@ class SubmissionDecisionTest(unittest.TestCase):
         )
 
 
+class ReviewLinkDecisionTest(unittest.TestCase):
+    """The invited auditor's link: it opens without login, so it has to save without one too.
+
+    The invitation is emailed as "Review link (no login required)" and the page
+    gates on the reviewer's name and email, but the save went to the console's
+    decision route, which is Firebase-authenticated. An auditor who had never
+    signed in could therefore open the page, fill it in, and be refused on save
+    with a missing authorization header — the exact failure these tests pin down.
+
+    Two halves matter and they pull against each other: no caller credential may
+    be demanded, and the identity recorded must still come from the invite the
+    signed-in buyer minted rather than from whoever happens to hold the link.
+    """
+
+    def setUp(self):
+        supplier_portal.reset_all()
+        self.token = supplier_portal.issue_token(
+            "Review Link Co", invited_by="buyer@firm.com")
+        session = supplier_portal._load_session(self.token)
+        session.form.update(
+            {k: v for k, v in vendor_c_form().items()
+             if k in supplier_portal.SUPPLIER_VISIBLE_FORM_FIELDS})
+        supplier_portal._save_session(session)
+        supplier_portal.submit_session(self.token, notify=False)
+        self.review_token = supplier_portal.issue_review_invite(
+            self.token,
+            "Imran Manager",
+            "manager01@mailinator.com",
+            invited_by="buyer@firm.com",
+        )
+        self.client = TestClient(main.app)
+        # Unlike the supplier-side paths the suite already covers, this route
+        # always has a recipient, so an unpatched save opens a real socket and
+        # waits for it. Captured instead — which also pins the address rather
+        # than inferring it from an outbox row.
+        self.mail: List[Dict[str, Any]] = []
+
+        async def _fake_send(to, subject, text, html=None):
+            self.mail.append({"to": to, "subject": subject, "text": text})
+            return main.SendResult(True, "delivered", to)
+
+        patcher = mock.patch("main._send_email", new=_fake_send)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _decide(self, body=None):
+        # No Authorization header on purpose: the auditor has never signed in.
+        return self.client.post(
+            f"/api/portal/review/{self.review_token}/decision",
+            json=body if body is not None
+            else {"decision": "approved", "justification": "Looks fine to go."},
+        )
+
+    @staticmethod
+    def _guards(path):
+        for route in main.app.routes:
+            if getattr(route, "path", None) == path and hasattr(route, "dependant"):
+                return [d.call for d in route.dependant.dependencies
+                        if getattr(d, "call", None) is main.verify_firebase_token]
+        return []
+
+    def test_an_auditor_who_never_signed_in_can_record(self):
+        """The bug: the page asked for name and email, the save demanded Firebase."""
+        response = self._decide()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["decision"]["decision"], "approved")
+        self.assertEqual(response.json()["submission"]["status"], "Approved")
+
+    def test_the_guard_is_on_the_console_route_and_not_the_review_link(self):
+        """Structural, for the same reason the suite's other route tests are.
+
+        An assertion that the console route returns 401 would only prove the
+        suite's AUTH_DISABLED setting; that one route is guarded and the other
+        is not is the property the fix rests on.
+        """
+        self.assertEqual(len(self._guards("/api/portal/submissions/{token}/decision")), 1)
+        self.assertEqual(self._guards("/api/portal/review/{review_token}/decision"), [])
+
+    def test_the_approver_is_the_invited_reviewer_not_the_caller(self):
+        """Holding the link proves who you are; it does not let you pick a name."""
+        response = self._decide({
+            "decision": "approved",
+            "justification": "Looks fine to go.",
+            "decided_by": "ceo@example.com",
+        })
+        self.assertEqual(response.status_code, 200, response.text)
+        decided_by = response.json()["decision"]["decided_by"]
+        self.assertEqual(decided_by, "Imran Manager (manager01@mailinator.com)")
+        self.assertNotEqual(decided_by, "ceo@example.com")
+
+    def test_the_decision_records_where_it_was_made(self):
+        """So the buyer can tell their own decision from their auditor's."""
+        self.assertEqual(
+            self._decide().json()["decision"]["source"], "review_invite")
+        console = self.client.post(
+            f"/api/portal/submissions/{self.token}/decision",
+            json={"decision": "approved", "justification": "Looks fine to go."},
+            headers={"Authorization": "Bearer owner@firm.com"},
+        )
+        self.assertEqual(console.status_code, 200, console.text)
+        self.assertEqual(console.json()["decision"]["source"], "")
+
+    def test_the_buyer_is_told_and_only_the_buyer(self):
+        """Feedback names the auditor and quotes them, so it goes to the inviter alone."""
+        self._decide()
+        # One message, addressed to whoever invited the supplier. Nothing here
+        # is routed through the supplier's own outcome mail, which stays on
+        # `email_service` and is asserted by `test_the_supplier_is_never_told`.
+        self.assertEqual(len(self.mail), 1, self.mail)
+        self.assertEqual(self.mail[0]["to"], "buyer@firm.com")
+        self.assertIn("Imran Manager", self.mail[0]["subject"])
+        self.assertIn("Looks fine to go.", self.mail[0]["text"])
+        rows = [r for r in main.list_notification_log()
+                if r["kind"] == "review_feedback" and r["token"] == self.token]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["recipient"], "buyer@firm.com")
+        self.assertTrue(rows[0]["sent"], rows[0]["detail"])
+
+    def test_the_supplier_is_never_told_who_reviewed_them(self):
+        """They keep the reason for a rejection — the resubmit loop runs on it."""
+        self._decide({"decision": "rejected",
+                      "justification": "The licence expired last month."})
+        view = supplier_portal.supplier_view(
+            supplier_portal._load_session(self.token))
+        self.assertEqual(view["status"], "Action required")
+        self.assertEqual(
+            view["decision"]["justification"], "The licence expired last month.")
+        self.assertNotIn("decided_by", view["decision"])
+        self.assertNotIn("source", view["decision"])
+        self.assertNotIn("Imran Manager", view["decision"]["justification"])
+        self.assertNotIn("manager01", repr(view["decision"]))
+
+    def test_a_rejection_still_has_to_say_why(self):
+        """The console's minimum reason travels with the link route."""
+        response = self._decide({"decision": "rejected", "justification": "no"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("reason", response.json()["detail"])
+
+    def test_an_unknown_link_is_refused(self):
+        response = self.client.post(
+            "/api/portal/review/not-a-real-token/decision",
+            json={"decision": "approved"},
+        )
+        self.assertEqual(response.status_code, 404)
+
+
 class _FakeSend:
     """A send that reports success without touching SMTP.
 

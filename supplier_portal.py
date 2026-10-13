@@ -179,6 +179,18 @@ _DB_PATH = os.environ.get("SUPPLIER_PORTAL_DB", "").strip()
 _DB: Any = None
 _DB_LOCK = threading.Lock()
 
+# The in-memory half of `portal_items`, for when durability is off.
+#
+# Every other kind this file stores — sessions, approvals, alerts, Glass Box,
+# Agent Activity — has its own dict and keeps working with SUPPLIER_PORTAL_DB
+# unset, which is the documented memory-only mode the tests run in. A review
+# invite had nowhere else to go, so in that mode `issue_review_invite` handed
+# the buyer a link that 404'd the moment the auditor opened it. Written through
+# on every save like the rest, and read only as a fallback: SQLite stays the
+# record of truth whenever it exists.
+_ITEMS: Dict[str, Dict[str, Any]] = {}
+_ITEMS_LOCK = threading.Lock()
+
 
 def _db() -> Any:
     """Lazily open the store. Returns None when durability is not configured."""
@@ -245,21 +257,28 @@ def _persist_session(session: Session) -> None:
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
     db = _db()
-    if db is not None:
-        with _DB_LOCK:
-            cur = db.execute(
-                "SELECT data FROM portal_items WHERE kind=? AND key=?",
-                (kind, key),
-            ).fetchone()
-            if cur:
-                try:
-                    return {"payload": json.loads(cur[0])}
-                except Exception:
-                    return None
+    if db is None:
+        # Durability is off, so the in-memory copy is the whole record. Reporting
+        # "not found" here would mean an invite written a moment ago had vanished.
+        with _ITEMS_LOCK:
+            cached = _ITEMS.get(f"{kind}\x00{key}")
+        return None if cached is None else {"payload": cached}
+    with _DB_LOCK:
+        cur = db.execute(
+            "SELECT data FROM portal_items WHERE kind=? AND key=?",
+            (kind, key),
+        ).fetchone()
+        if cur:
+            try:
+                return {"payload": json.loads(cur[0])}
+            except Exception:
+                return None
     return None
 
 
 def _persist_item(kind: str, key: str, payload: Dict[str, Any]) -> None:
+    with _ITEMS_LOCK:
+        _ITEMS[f"{kind}\x00{key}"] = payload
     db = _db()
     if db is None:
         return
@@ -273,17 +292,22 @@ def _persist_item(kind: str, key: str, payload: Dict[str, Any]) -> None:
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
     db = _db()
-    if db is not None:
-        with _DB_LOCK:
-            cur = db.execute(
-                "SELECT data FROM portal_items WHERE kind=? AND key=?",
-                (kind, key),
-            ).fetchone()
-            if cur:
-                try:
-                    return {"payload": json.loads(cur[0])}
-                except Exception:
-                    return None
+    if db is None:
+        # Durability is off, so the in-memory copy is the whole record. Reporting
+        # "not found" here would mean an invite written a moment ago had vanished.
+        with _ITEMS_LOCK:
+            cached = _ITEMS.get(f"{kind}\x00{key}")
+        return None if cached is None else {"payload": cached}
+    with _DB_LOCK:
+        cur = db.execute(
+            "SELECT data FROM portal_items WHERE kind=? AND key=?",
+            (kind, key),
+        ).fetchone()
+        if cur:
+            try:
+                return {"payload": json.loads(cur[0])}
+            except Exception:
+                return None
     return None
 
 
@@ -342,17 +366,22 @@ def _restore() -> None:
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
     db = _db()
-    if db is not None:
-        with _DB_LOCK:
-            cur = db.execute(
-                "SELECT data FROM portal_items WHERE kind=? AND key=?",
-                (kind, key),
-            ).fetchone()
-            if cur:
-                try:
-                    return {"payload": json.loads(cur[0])}
-                except Exception:
-                    return None
+    if db is None:
+        # Durability is off, so the in-memory copy is the whole record. Reporting
+        # "not found" here would mean an invite written a moment ago had vanished.
+        with _ITEMS_LOCK:
+            cached = _ITEMS.get(f"{kind}\x00{key}")
+        return None if cached is None else {"payload": cached}
+    with _DB_LOCK:
+        cur = db.execute(
+            "SELECT data FROM portal_items WHERE kind=? AND key=?",
+            (kind, key),
+        ).fetchone()
+        if cur:
+            try:
+                return {"payload": json.loads(cur[0])}
+            except Exception:
+                return None
     return None
 
 
@@ -586,6 +615,8 @@ def reset_all() -> None:
         _GLASSBOX.clear()
     with _ACTIVITY_LOCK:
         _ACTIVITY.clear()
+    with _ITEMS_LOCK:
+        _ITEMS.clear()
     if db is not None:
         with _DB_LOCK:
             db.execute("DELETE FROM portal_sessions")
@@ -595,17 +626,22 @@ def reset_all() -> None:
 
 def _get_item(kind: str, key: str) -> Optional[Dict[str, Any]]:
     db = _db()
-    if db is not None:
-        with _DB_LOCK:
-            cur = db.execute(
-                "SELECT data FROM portal_items WHERE kind=? AND key=?",
-                (kind, key),
-            ).fetchone()
-            if cur:
-                try:
-                    return {"payload": json.loads(cur[0])}
-                except Exception:
-                    return None
+    if db is None:
+        # Durability is off, so the in-memory copy is the whole record. Reporting
+        # "not found" here would mean an invite written a moment ago had vanished.
+        with _ITEMS_LOCK:
+            cached = _ITEMS.get(f"{kind}\x00{key}")
+        return None if cached is None else {"payload": cached}
+    with _DB_LOCK:
+        cur = db.execute(
+            "SELECT data FROM portal_items WHERE kind=? AND key=?",
+            (kind, key),
+        ).fetchone()
+        if cur:
+            try:
+                return {"payload": json.loads(cur[0])}
+            except Exception:
+                return None
     return None
 
 
@@ -2538,6 +2574,7 @@ def record_submission_decision(
     decision: str,
     approver: str,
     justification: str = "",
+    source: str = "",
 ) -> Dict[str, Any]:
     """An internal reviewer approves or rejects a submitted form.
 
@@ -2559,6 +2596,11 @@ def record_submission_decision(
     - A rejection must say why. The supplier is told to act without being told
       what to act on, and the questions they can see are the ones document
       extraction raised, which are frequently not the reason for rejection.
+
+    `source` records where the decision came from — `"review_invite"` when it
+    was recorded from a link sent to an invited auditor rather than by someone
+    signed into the console. The buyer can then tell their own decision apart
+    from their auditor's on the same submission.
     """
     normalised = (decision or "").strip().lower()
     if normalised not in ("approved", "rejected"):
@@ -2593,6 +2635,9 @@ def record_submission_decision(
         "justification": reason,
         "decided_by": approver,
         "decided_at": time.time(),
+        # Where the decision was recorded: "" from the console, "review_invite"
+        # from a link sent to an invited auditor.
+        "source": source,
         # Kept from the dossier so the buyer can see what was being approved.
         "vendor_id": session.internal.get("vendor_id", ""),
         "assigned_risk_tier": session.internal.get("assigned_risk_tier"),

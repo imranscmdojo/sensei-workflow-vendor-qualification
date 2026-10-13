@@ -22,6 +22,7 @@ disagrees. A compliance claim is never asserted on top of numbers that do not
 add up.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -1751,3 +1752,123 @@ async def validate_review_invite(review_token: str, payload: Dict[str, Any] = Bo
         "submission": supplier_portal.buyer_view(submission_token),
         "report": await _report_payload(submission_token),
     }
+
+
+def _reviewer_label(invite: Dict[str, Any]) -> str:
+    """Who the invite was minted for, as a name the buyer will recognise.
+
+    Taken from the invite, never from the request. The buyer typed these into
+    the invitation while signed in, so the label is theirs; a caller who has the
+    link cannot write a different name into the audit record.
+    """
+    name = str(invite.get("reviewer_name") or "").strip()
+    email = str(invite.get("reviewer_email") or "").strip()
+    if name and email:
+        return f"{name} ({email})"
+    return name or email or str(invite.get("invited_by") or "").strip()
+
+
+async def _notify_review_feedback(
+    submission_token: str,
+    reviewer: str,
+    record: Dict[str, Any],
+) -> None:
+    """Tell the buyer their invited auditor has come back with feedback.
+
+    To the buyer and nowhere else. The supplier already receives the outcome
+    mail — approved, or asked for changes — from `record_submission_decision`,
+    which is what the reject-and-resubmit loop runs on; what they must never get
+    is this one, because it names the auditor and quotes what they wrote about
+    the submission. A send failure never reaches the caller: the decision is
+    already recorded by then, and losing it to an SMTP error would be the worse
+    trade.
+    """
+    session = supplier_portal._load_session(submission_token)
+    if not session:
+        return
+    vendor = session.vendor_name or "A vendor"
+    subject = f"Internal review feedback: {vendor} — {reviewer}"
+    link = (
+        supplier_portal.report_link(submission_token)
+        if os.environ.get("SUPPLIER_PORTAL_BASE_URL")
+        else ""
+    )
+    recipient = (session.invited_by or "").strip()
+    verdict = "approved" if record.get("decision") == "approved" else "returned for changes"
+    note = str(record.get("justification") or "").strip()
+    body = (
+        f"{reviewer} reviewed {vendor} and {verdict} the submission.\n\n"
+        + (f"Note left:\n{note}\n\n" if note else "No note was left.\n\n")
+        + "Recorded from an invited review link, so this is their feedback and "
+        "not yours to re-send.\n"
+    )
+    if link:
+        body += f"\nOpen the submission:\n{link}\n"
+
+    if not recipient:
+        await log_notification_async(
+            "review_feedback",
+            subject,
+            "",
+            False,
+            "No inviter on file, so the auditor's feedback was not emailed.",
+            token=submission_token,
+            link=link,
+        )
+        return
+
+    try:
+        result = await _send_email(recipient, subject, body)
+        sent, detail = bool(result.sent), (result.detail or "")
+    except Exception as exc:  # noqa: BLE001 - never lose a decision to mail
+        sent, detail = False, f"{type(exc).__name__}: {exc}"
+    await log_notification_async(
+        "review_feedback", subject, recipient, sent, detail, token=submission_token, link=link
+    )
+
+
+@app.post("/api/portal/review/{review_token}/decision")
+async def review_invite_decision(
+    review_token: str,
+    payload: Dict[str, Any] = Body(...),
+) -> Dict[str, Any]:
+    """Record an invited auditor's approve/reject without asking them to sign in.
+
+    The console's own decision route is Firebase-authenticated, and deliberately
+    so: the approver is read off the verified token rather than the body, so the
+    audit record cannot be attributed to whoever the caller typed. That route is
+    wrong for a review link, which is advertised as "no login required" and gated
+    on name and email — an auditor who has never signed in would reach the page,
+    fill it in, and be refused on save.
+
+    So this route uses the link as the credential instead. The invite is a
+    secret minted by an authenticated buyer, expires in seven days, and carries
+    the name and email that person invited; `get_review_invite` rejects a
+    missing or expired one. The approver is read from that invite, which keeps
+    the property the console route exists for — the caller never supplies the
+    identity, only proves they hold it.
+    """
+    invite = supplier_portal.get_review_invite(review_token)
+    submission_token = str(invite.get("submission_token") or "")
+    reviewer = _reviewer_label(invite)
+    if not reviewer:
+        raise HTTPException(
+            status_code=400,
+            detail="This invitation carries no reviewer name or email to record.",
+        )
+
+    record = supplier_portal.record_submission_decision(
+        submission_token,
+        str(payload.get("decision") or ""),
+        reviewer,
+        str(payload.get("justification") or ""),
+        source="review_invite",
+    )
+    # Buyer only — see `_notify_review_feedback`. Guarded because the decision is
+    # already recorded by now: losing the response to a mail or log failure would
+    # leave the auditor looking at an error for a save that actually landed.
+    try:
+        await _notify_review_feedback(submission_token, reviewer, record)
+    except Exception:  # noqa: BLE001 - never fail a recorded decision
+        pass
+    return {"decision": record, "submission": supplier_portal.buyer_view(submission_token)}
